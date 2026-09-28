@@ -251,11 +251,14 @@ impl PciDevices {
         vm: &Arc<KvmVm>,
         config: DevicePassthroughConfig,
     ) -> Result<(), PciManagerError> {
+        let source = config
+            .source()
+            .map_err(|e| PciManagerError::Vfio(VfioError::Config(e)))?;
         for device in self.vfio_devices.iter() {
             let device = device.lock().unwrap();
-            // SAFETY: We must never add 2 devices with same id or same SBDF
+            // SAFETY: We must never add 2 devices with same id or same source
             assert_ne!(device.config.id, config.id);
-            assert_ne!(device.config.sbdf, config.sbdf);
+            assert_ne!(device.config.source().ok(), Some(source));
         }
 
         let pci_device_bdf = self.pci_segment.next_device_sbdf()?;

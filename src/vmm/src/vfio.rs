@@ -30,7 +30,9 @@ use crate::utils::{
     align_down_host_page, align_up_host_page, is_host_page_aligned, offset_from_lower_host_page,
     u64_to_usize, usize_to_u64,
 };
-use crate::vmm_config::device_passthrough::DevicePassthroughConfig;
+use crate::vmm_config::device_passthrough::{
+    DevicePassthroughConfig, DevicePassthroughConfigError, DevicePassthroughSource,
+};
 use crate::vstate::bus::BusDevice;
 use crate::vstate::interrupts::InterruptError;
 use crate::vstate::memory::{GuestMemoryMmap, GuestRegionType};
@@ -65,6 +67,8 @@ pub enum VfioError {
     SetUserMemoryRegion(VmError),
     /// vfio-ioctls crate error: {0}
     VfioIoctls(#[from] vfio_ioctls::VfioError),
+    /// Invalid passthrough configuration: {0}
+    Config(DevicePassthroughConfigError),
     /// Cannot create Msix vector group: {0}
     MsixConfig(#[from] InterruptError),
     /// Device does not provide MSIx irq
@@ -175,6 +179,8 @@ pub struct VfioDevice {
     pub emulated_areas: VfioBarEmulatedAreas,
     msix_state: VfioMsixState,
     masks: Vec<VfioRegisterMask>,
+    /// Size of the device's config region; accesses past it are ignored.
+    config_size: u64,
     vm: Arc<KvmVm>,
 }
 
@@ -363,6 +369,11 @@ impl PciDevice for VfioDevice {
         data: &[u8],
     ) -> Option<Arc<Barrier>> {
         let mut handled: bool = false;
+        if u64::from(reg_idx) * 4 >= self.config_size {
+            // Beyond the device's config region (e.g. extended config space of
+            // a conventional PCI mdev): nothing to write.
+            return None;
+        }
         if BAR0_REG_IDX <= reg_idx && reg_idx < BAR0_REG_IDX + u16::from(NUM_BAR_REGS) {
             // reg_idx is in [BAR0_REG, BAR0_REG+NUM_BAR_REGS), so the difference is 0..5.
             #[allow(clippy::cast_possible_truncation)]
@@ -398,6 +409,10 @@ impl PciDevice for VfioDevice {
     }
     fn read_config_register(&mut self, reg_idx: u16) -> u32 {
         let mut result: u32 = 0;
+        if u64::from(reg_idx) * 4 >= self.config_size {
+            // Reads as zero, which a guest takes as "no extended capabilities".
+            return 0;
+        }
         if BAR0_REG_IDX <= reg_idx && reg_idx < BAR0_REG_IDX + u16::from(NUM_BAR_REGS) {
             // reg_idx is in [BAR0_REG, BAR0_REG+NUM_BAR_REGS), so the difference is 0..5.
             #[allow(clippy::cast_possible_truncation)]
@@ -1172,20 +1187,34 @@ fn vfio_init_device(
     config: DevicePassthroughConfig,
     sbdf: PciSBDF,
 ) -> Result<VfioDevice, VfioError> {
-    let sysfs_path = format!(
-        "/sys/bus/pci/devices/{:04x}:{:02x}:{:02x}.{:x}",
-        config.sbdf.segment(),
-        config.sbdf.bus(),
-        config.sbdf.device(),
-        config.sbdf.function()
-    );
-    debug!("Opening device at path: {}", sysfs_path);
-
-    let device = InternalVfioDevice::new(
-        Path::new(&sysfs_path),
-        container.clone() as Arc<dyn vfio_ioctls::VfioOps>,
-    )?;
+    let ops = container.clone() as Arc<dyn vfio_ioctls::VfioOps>;
+    let device = match config.source().map_err(VfioError::Config)? {
+        DevicePassthroughSource::Sysfs(sbdf) => {
+            let sysfs_path = format!(
+                "/sys/bus/pci/devices/{:04x}:{:02x}:{:02x}.{:x}",
+                sbdf.segment(),
+                sbdf.bus(),
+                sbdf.device(),
+                sbdf.function()
+            );
+            debug!("Opening device at path: {}", sysfs_path);
+            InternalVfioDevice::new(Path::new(&sysfs_path), ops)?
+        }
+        DevicePassthroughSource::Group { group_path, device } => {
+            debug!(
+                "Opening device {device} of group {}",
+                group_path.display()
+            );
+            InternalVfioDevice::new_from_group(group_path, device, ops)?
+        }
+    };
     device.reset();
+
+    // mdev config regions are often only the 256 byte legacy space. A read
+    // larger than the region is silently dropped by vfio-ioctls, so bound it.
+    let config_size = device
+        .get_region_size(VFIO_PCI_CONFIG_REGION_INDEX)
+        .min(u64::from(PCI_CONFIG_SPACE_REGS) * 4);
 
     let Some(msix_irq_info) = device.get_irq_info(VFIO_PCI_MSIX_IRQ_INDEX) else {
         return Err(VfioError::NoMsixIrq);
@@ -1195,7 +1224,11 @@ fn vfio_init_device(
     }
 
     let mut config_space = [0_u32; PCI_CONFIG_SPACE_REGS as usize];
-    device.region_read(VFIO_PCI_CONFIG_REGION_INDEX, config_space.as_mut_bytes(), 0);
+    device.region_read(
+        VFIO_PCI_CONFIG_REGION_INDEX,
+        &mut config_space.as_mut_bytes()[..u64_to_usize(config_size)],
+        0,
+    );
     let (msix_cap_and_register, masks) = vfio_get_pci_capabilities(&config_space);
 
     // Only devices with MSI-X cap and irqs are supported
@@ -1281,6 +1314,7 @@ fn vfio_init_device(
         emulated_areas,
         msix_state,
         masks,
+        config_size,
         vm: vm.clone(),
     };
 
