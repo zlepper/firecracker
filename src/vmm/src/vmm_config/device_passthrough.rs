@@ -118,10 +118,7 @@ impl DevicePassthroughConfig {
                         group_path.display().to_string(),
                     ));
                 }
-                Ok(DevicePassthroughSource::Group {
-                    group_path,
-                    device,
-                })
+                Ok(DevicePassthroughSource::Group { group_path, device })
             }
             _ => Err(DevicePassthroughConfigError::AmbiguousSource),
         }
@@ -254,13 +251,17 @@ mod group_source_tests {
         group_config("gpu0", "/dev/vfio/gpu0", "../../etc")
             .source()
             .unwrap_err();
-        group_config("gpu0", "dev/vfio/gpu0", "uuid").source().unwrap_err();
+        group_config("gpu0", "dev/vfio/gpu0", "uuid")
+            .source()
+            .unwrap_err();
         group_config("gpu0", "/dev/vfio/gpu0", "")
             .source()
             .unwrap_err();
         let uuid = "e7a9c3b0-6b0f-4d8e-9a1c-2f4b5d6e7f80";
         assert_eq!(
-            group_config("gpu0", "/dev/vfio/gpu0", uuid).source().unwrap(),
+            group_config("gpu0", "/dev/vfio/gpu0", uuid)
+                .source()
+                .unwrap(),
             DevicePassthroughSource::Group {
                 group_path: Path::new("/dev/vfio/gpu0"),
                 device: uuid,

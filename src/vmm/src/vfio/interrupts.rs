@@ -22,6 +22,7 @@ use crate::logger::{debug, error};
 use crate::pci::PciSBDF;
 use crate::pci::msix::MsixTableEntry;
 use crate::snapshot::Persist;
+use crate::utils::u64_to_usize;
 use crate::vstate::interrupts::MsixVectorGroup;
 use crate::vstate::vm::KvmVm;
 
@@ -181,7 +182,7 @@ impl VfioMsi {
             let offset = u64::from(reg_idx) * 4 + i as u64;
             // The first two bytes (id and next pointer) come from the device.
             if self.contains(offset) && offset >= u64::from(self.cap_offset) + 2 {
-                *byte = self.bytes[(offset - u64::from(self.cap_offset)) as usize];
+                *byte = self.bytes[u64_to_usize(offset - u64::from(self.cap_offset))];
             }
         }
         u32::from_le_bytes(bytes)
@@ -196,7 +197,7 @@ impl VfioMsi {
             if !self.contains(offset) {
                 continue;
             }
-            let index = (offset - u64::from(self.cap_offset)) as usize;
+            let index = u64_to_usize(offset - u64::from(self.cap_offset));
             let mask = writable[index];
             self.bytes[index] = (self.bytes[index] & !mask) | (value & mask);
         }
@@ -405,7 +406,10 @@ mod tests {
         assert_eq!(VfioMsi::cap_size(0), 10);
         assert_eq!(VfioMsi::cap_size(MSI_CTL_64BIT), 14);
         assert_eq!(VfioMsi::cap_size(MSI_CTL_PER_VECTOR_MASK), 20);
-        assert_eq!(VfioMsi::cap_size(MSI_CTL_64BIT | MSI_CTL_PER_VECTOR_MASK), 24);
+        assert_eq!(
+            VfioMsi::cap_size(MSI_CTL_64BIT | MSI_CTL_PER_VECTOR_MASK),
+            24
+        );
     }
 
     #[test]

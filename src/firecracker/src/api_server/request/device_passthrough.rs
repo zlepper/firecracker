@@ -27,7 +27,10 @@ pub(crate) fn parse_put_device_passthrough(
 
     if let Err(err) = device_cfg.source() {
         METRICS.put_api_requests.device_passthrough_fails.inc();
-        return Err(RequestError::Generic(StatusCode::BadRequest, err.to_string()));
+        return Err(RequestError::Generic(
+            StatusCode::BadRequest,
+            err.to_string(),
+        ));
     }
 
     if id != device_cfg.id {

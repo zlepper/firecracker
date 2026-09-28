@@ -18,6 +18,7 @@ pub(crate) const NO_FILE_ARG: &str = "no-file";
 pub(crate) const MEMLOCK_ARG: &str = "memlock";
 
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::enum_variant_names)]
 pub enum Resource {
     // Size of created files.
     RlimitFsize,

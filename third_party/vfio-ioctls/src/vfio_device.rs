@@ -30,13 +30,13 @@ use crate::vfio_ioctls::*;
 use crate::{Result, VfioError};
 #[cfg(all(feature = "kvm", not(test)))]
 use kvm_bindings::{
-    kvm_device_attr, KVM_DEV_VFIO_FILE, KVM_DEV_VFIO_FILE_ADD, KVM_DEV_VFIO_FILE_DEL,
+    KVM_DEV_VFIO_FILE, KVM_DEV_VFIO_FILE_ADD, KVM_DEV_VFIO_FILE_DEL, kvm_device_attr,
 };
 #[cfg(all(feature = "kvm", not(test)))]
 use kvm_ioctls::DeviceFd as KvmDeviceFd;
 #[cfg(all(feature = "mshv", not(test)))]
 use mshv_bindings::{
-    mshv_device_attr, MSHV_DEV_VFIO_FILE, MSHV_DEV_VFIO_FILE_ADD, MSHV_DEV_VFIO_FILE_DEL,
+    MSHV_DEV_VFIO_FILE, MSHV_DEV_VFIO_FILE_ADD, MSHV_DEV_VFIO_FILE_DEL, mshv_device_attr,
 };
 #[cfg(all(feature = "mshv", not(test)))]
 use mshv_ioctls::DeviceFd as MshvDeviceFd;

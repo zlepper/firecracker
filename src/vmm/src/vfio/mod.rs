@@ -39,8 +39,8 @@ use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vm::{KvmVm, VmError};
 
 mod interrupts;
-pub use interrupts::{VfioIntxState, VfioIrqMode, VfioMsiState};
 use interrupts::{VfioIntx, VfioMsi, set_irq_mode};
+pub use interrupts::{VfioIntxState, VfioIrqMode, VfioMsiState};
 
 // Number of 4 byte registers in the config space
 const PCI_CONFIG_SPACE_REGS: u16 = 1024;
@@ -263,7 +263,10 @@ impl VfioDevice {
             self.msi.as_ref(),
             msix_fds,
         ) {
-            error!("[{}] Failed to switch interrupt mode to {mode:?}: {e}", self.config.id);
+            error!(
+                "[{}] Failed to switch interrupt mode to {mode:?}: {e}",
+                self.config.id
+            );
         }
     }
 }
@@ -546,18 +549,18 @@ impl PciDevice for VfioDevice {
     }
 }
 
+/// The MSI-X capability and its register, if present.
+type VfioMsixCapAndRegister = Option<(MsixCap, u8)>;
+/// The MSI capability offset and message control, if present.
+type VfioMsiCap = Option<(u8, u16)>;
+
 /// Go through the PCI config space and reads all legacy and PCIe capabilities. Find the MSIx
 /// cap if present and construct an array of masks which should be used to overwrite values in the
 /// config space during read operations.
 fn vfio_get_pci_capabilities(
     config_space: &[u32; PCI_CONFIG_SPACE_REGS as usize],
-) -> (
-    Option<(MsixCap, u8)>,
-    Option<(u8, u16)>,
-    Vec<VfioRegisterMask>,
-) {
-    let (msix_cap_and_register, msi_cap, has_pci_express_cap) =
-        vfio_read_legacy_caps(config_space);
+) -> (VfioMsixCapAndRegister, VfioMsiCap, Vec<VfioRegisterMask>) {
+    let (msix_cap_and_register, msi_cap, has_pci_express_cap) = vfio_read_legacy_caps(config_space);
 
     // PCIe extended capabilities only exist if the device exposes a PCI Express capability.
     let masks = if has_pci_express_cap {
@@ -586,7 +589,7 @@ fn vfio_config_space_read_bytes(
 /// whether the device exposes a PCI Express capability.
 fn vfio_read_legacy_caps(
     config_space: &[u32; PCI_CONFIG_SPACE_REGS as usize],
-) -> (Option<(MsixCap, u8)>, Option<(u8, u16)>, bool) {
+) -> (VfioMsixCapAndRegister, VfioMsiCap, bool) {
     let mut next_cap_offset: u8 = 0;
     vfio_config_space_read_bytes(
         config_space,
@@ -1329,10 +1332,7 @@ fn vfio_init_device(
             InternalVfioDevice::new(Path::new(&sysfs_path), ops)?
         }
         DevicePassthroughSource::Group { group_path, device } => {
-            debug!(
-                "Opening device {device} of group {}",
-                group_path.display()
-            );
+            debug!("Opening device {device} of group {}", group_path.display());
             InternalVfioDevice::new_from_group(group_path, device, ops)?
         }
     };
@@ -2389,7 +2389,8 @@ mod tests {
                 })],
             )]);
 
-            let err = vfio_calculate_bar_areas(&vmm_bars, &region_infos, Some(&msix_cap)).unwrap_err();
+            let err =
+                vfio_calculate_bar_areas(&vmm_bars, &region_infos, Some(&msix_cap)).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -2442,11 +2443,21 @@ mod tests {
             let bar_area = emulated_areas[0];
             assert_eq!(bar_area.gpa, 0x1000);
             assert_eq!(bar_area.size, 0x4000);
-            let table =
-                vfio_distribute_emulated_access(&emulated_areas, Some(&msix_cap), 0x1000, 0x1010, 4);
+            let table = vfio_distribute_emulated_access(
+                &emulated_areas,
+                Some(&msix_cap),
+                0x1000,
+                0x1010,
+                4,
+            );
             assert!(matches!(table, HandleBarAccessResult::MsixTable(0x10)));
-            let hole =
-                vfio_distribute_emulated_access(&emulated_areas, Some(&msix_cap), 0x1000, 0x2004, 4);
+            let hole = vfio_distribute_emulated_access(
+                &emulated_areas,
+                Some(&msix_cap),
+                0x1000,
+                0x2004,
+                4,
+            );
             assert!(matches!(
                 hole,
                 HandleBarAccessResult::Device {
