@@ -728,6 +728,66 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Hermes: VFIO interrupt mode changes",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15214,
+                        "comment": "VFIO_DEVICE_SET_IRQS"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Hermes: VFIO migration state on pause, resume and snapshot",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15221,
+                        "comment": "VFIO_DEVICE_FEATURE"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Hermes: DMA-map virtio-mem slots plugged while a VFIO device is attached",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15217,
+                        "comment": "VFIO_IOMMU_MAP_DMA"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Hermes: DMA-unmap virtio-mem slots",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15218,
+                        "comment": "VFIO_IOMMU_UNMAP_DMA"
+                    }
+                ]
+            },
+            {
+                "syscall": "pread64",
+                "comment": "Hermes: VFIO device config space and region reads outside vCPU exits"
+            },
+            {
+                "syscall": "pwrite64",
+                "comment": "Hermes: VFIO device config space and region writes outside vCPU exits"
+            },
+            {
+                "syscall": "ioctl",
                 "comment": "Needed for opening tap device during net hotplug",
                 "args": [
                     {
@@ -1625,6 +1685,19 @@
             {
                 "syscall": "pwrite64",
                 "comment": "Used by VFIO passthrough to write device PCI config and BAR regions on vCPU MMIO/PIO exits"
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Hermes: arm the VFIO interrupt mode the guest enables in config space",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15214,
+                        "comment": "VFIO_DEVICE_SET_IRQS"
+                    }
+                ]
             }
         ]
     }
