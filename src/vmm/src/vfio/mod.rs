@@ -1043,7 +1043,23 @@ fn vfio_calculate_bar_areas(
                     // If table is within the region, then the expanded MSIx emulated area must be
                     // within the BAR.
                     assert!(msix_table_offset + msix_table_size <= bar_size);
-
+                }
+                if sparse_mmap_cap.is_some() {
+                    // Hermes: the holes between sparse mmap areas are registers the kernel
+                    // traps (a vGPU's BAR0 is laid out like this). Emulate the whole BAR, so
+                    // every hole reaches the device; the mmapped areas are KVM memslots on top
+                    // and never exit. The MSI-X table, if any, is served from this area too.
+                    debug!(
+                        "BAR{bar_idx} has sparse mmap areas. Emulated area: [{bar_gpa:#x}..{:#x}]",
+                        bar_gpa + bar_size
+                    );
+                    emulated_areas.push(VfioBarEmulatedArea {
+                        bar_idx,
+                        in_bar_offset: 0,
+                        gpa: bar_gpa,
+                        size: bar_size,
+                    });
+                } else if contains_msix_table {
                     debug!(
                         "BAR{bar_idx} MSIx table emulated area: [{:#x}..{:#x}]",
                         bar_gpa + msix_table_offset,
@@ -1097,21 +1113,16 @@ fn vfio_calculate_bar_areas(
                             // through to the guest while we also emulate it, which would let the
                             // guest program interrupts directly.
                             let gpa = bar_gpa + area.offset;
+                            let table_gpa = bar_gpa + msix_table_offset;
                             if contains_msix_table
-                                && let Some(table_area) = emulated_areas.last()
-                                && vfio_ranges_overlap(
-                                    gpa,
-                                    area.size,
-                                    table_area.gpa,
-                                    table_area.size,
-                                )
+                                && vfio_ranges_overlap(gpa, area.size, table_gpa, msix_table_size)
                             {
                                 return Err(VfioError::SparseMmapAreaOverlapsEmulatedArea(
                                     bar_idx,
                                     gpa,
                                     area.size,
-                                    table_area.gpa,
-                                    table_area.size,
+                                    table_gpa,
+                                    msix_table_size,
                                 ));
                             }
                             mmappable_areas.push(VfioBarMappableArea {
