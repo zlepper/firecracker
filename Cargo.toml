@@ -14,6 +14,8 @@ default-members = [
     "src/acpi-tables",
 ]
 resolver = "2"
+# Vendored crates patched for Hermes live outside the workspace.
+exclude = ["third_party"]
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
@@ -41,3 +43,7 @@ strip = "none"
 
 [profile.bench]
 strip = "debuginfo"
+
+# Hermes: vfio-ioctls with group-node based device opening (no sysfs in the jail).
+[patch.crates-io]
+vfio-ioctls = { path = "third_party/vfio-ioctls" }

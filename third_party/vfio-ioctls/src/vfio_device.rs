@@ -1,0 +1,2890 @@
+// Copyright © 2019 Intel Corporation
+// Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
+//
+// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
+
+use std::any::Any;
+use std::collections::HashMap;
+use std::convert::{TryFrom as _, TryInto as _};
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::mem::{self, ManuallyDrop};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::prelude::FileExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use byteorder::{ByteOrder, NativeEndian};
+#[cfg(feature = "vfio_cdev")]
+use iommufd_bindings::*;
+#[cfg(feature = "vfio_cdev")]
+use iommufd_ioctls::IommuFd;
+use log::{debug, error, warn};
+use vfio_bindings::bindings::vfio::*;
+use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion, MemoryRegionAddress};
+use vmm_sys_util::eventfd::EventFd;
+
+use crate::fam::vec_with_array_field;
+use crate::vfio_ioctls::*;
+use crate::{Result, VfioError};
+#[cfg(all(feature = "kvm", not(test)))]
+use kvm_bindings::{
+    kvm_device_attr, KVM_DEV_VFIO_FILE, KVM_DEV_VFIO_FILE_ADD, KVM_DEV_VFIO_FILE_DEL,
+};
+#[cfg(all(feature = "kvm", not(test)))]
+use kvm_ioctls::DeviceFd as KvmDeviceFd;
+#[cfg(all(feature = "mshv", not(test)))]
+use mshv_bindings::{
+    mshv_device_attr, MSHV_DEV_VFIO_FILE, MSHV_DEV_VFIO_FILE_ADD, MSHV_DEV_VFIO_FILE_DEL,
+};
+#[cfg(all(feature = "mshv", not(test)))]
+use mshv_ioctls::DeviceFd as MshvDeviceFd;
+#[cfg(all(any(feature = "kvm", feature = "mshv"), not(test)))]
+use vmm_sys_util::errno::Error;
+
+#[derive(Debug)]
+enum DeviceFdInner {
+    #[cfg(all(feature = "kvm", not(test)))]
+    Kvm(KvmDeviceFd),
+    #[cfg(all(feature = "mshv", not(test)))]
+    Mshv(MshvDeviceFd),
+}
+
+#[derive(Debug)]
+/// A wrapper for a device fd from either KVM or MSHV.
+pub struct VfioDeviceFd(DeviceFdInner);
+
+impl VfioDeviceFd {
+    /// Create an VfioDeviceFd from a KVM DeviceFd
+    #[cfg(all(feature = "kvm", not(test)))]
+    pub fn new_from_kvm(fd: KvmDeviceFd) -> Self {
+        VfioDeviceFd(DeviceFdInner::Kvm(fd))
+    }
+    /// Extract the KVM DeviceFd from an VfioDeviceFd
+    #[cfg(all(feature = "kvm", not(test)))]
+    pub fn to_kvm(self) -> Result<KvmDeviceFd> {
+        match self {
+            VfioDeviceFd(DeviceFdInner::Kvm(fd)) => Ok(fd),
+            #[allow(unreachable_patterns)]
+            _ => Err(VfioError::VfioDeviceFdWrongType),
+        }
+    }
+    /// Create an VfioDeviceFd from an MSHV DeviceFd
+    #[cfg(all(feature = "mshv", not(test)))]
+    pub fn new_from_mshv(fd: MshvDeviceFd) -> Self {
+        VfioDeviceFd(DeviceFdInner::Mshv(fd))
+    }
+    /// Extract the MSHV DeviceFd from an VfioDeviceFd
+    #[cfg(all(feature = "mshv", not(test)))]
+    pub fn to_mshv(self) -> Result<MshvDeviceFd> {
+        match self {
+            VfioDeviceFd(DeviceFdInner::Mshv(fd)) => Ok(fd),
+            #[allow(unreachable_patterns)]
+            _ => Err(VfioError::VfioDeviceFdWrongType),
+        }
+    }
+    /// Try to duplicate an VfioDeviceFd
+    #[cfg(all(any(feature = "kvm", feature = "mshv"), not(test)))]
+    pub fn try_clone(&self) -> Result<Self> {
+        match &self.0 {
+            #[cfg(feature = "kvm")]
+            DeviceFdInner::Kvm(fd) => {
+                // SAFETY: FFI call to libc
+                let dup_fd = unsafe { libc::dup(fd.as_raw_fd()) };
+                if dup_fd == -1 {
+                    Err(VfioError::VfioDeviceDupFd)
+                } else {
+                    // SAFETY: dup_fd is a valid device fd for KVM
+                    let kvm_fd = unsafe { KvmDeviceFd::from_raw_fd(dup_fd) };
+                    Ok(VfioDeviceFd(DeviceFdInner::Kvm(kvm_fd)))
+                }
+            }
+            #[cfg(feature = "mshv")]
+            DeviceFdInner::Mshv(fd) => {
+                // SAFETY: FFI call to libc
+                let dup_fd = unsafe { libc::dup(fd.as_raw_fd()) };
+                if dup_fd == -1 {
+                    Err(VfioError::VfioDeviceDupFd)
+                } else {
+                    // SAFETY: dup_fd is a valid device fd for MSHV
+                    let mshv_fd = unsafe { MshvDeviceFd::from_raw_fd(dup_fd) };
+                    Ok(VfioDeviceFd(DeviceFdInner::Mshv(mshv_fd)))
+                }
+            }
+        }
+    }
+}
+
+pub type VfioContainerDeviceHandle = Arc<VfioDeviceFd>;
+
+#[repr(C)]
+#[derive(Debug, Default)]
+// A VFIO region structure with an incomplete array for region
+// capabilities information.
+//
+// When the VFIO_DEVICE_GET_REGION_INFO ioctl returns with
+// VFIO_REGION_INFO_FLAG_CAPS flag set, it also provides the size of the region
+// capabilities information. This is a kernel hint for us to fetch this
+// information by calling the same ioctl, but with the argument size set to
+// the region plus the capabilities information array length. The kernel will
+// then fill our vfio_region_info_with_cap structure with both the region info
+// and its capabilities.
+pub struct vfio_region_info_with_cap {
+    pub region_info: vfio_region_info,
+    cap_info: __IncompleteArrayField<u8>,
+}
+
+impl vfio_region_info_with_cap {
+    fn from_region_info(region_info: &vfio_region_info) -> Vec<Self> {
+        let region_info_size: u32 = mem::size_of::<vfio_region_info>() as u32;
+        let cap_len: usize = (region_info.argsz - region_info_size) as usize;
+
+        let mut region_with_cap = vec_with_array_field::<Self, u8>(cap_len);
+        region_with_cap[0].region_info.argsz = region_info.argsz;
+        region_with_cap[0].region_info.flags = 0;
+        region_with_cap[0].region_info.index = region_info.index;
+        region_with_cap[0].region_info.cap_offset = 0;
+        region_with_cap[0].region_info.size = 0;
+        region_with_cap[0].region_info.offset = 0;
+
+        region_with_cap
+    }
+}
+/// Trait to define common operations exposed to user-space drivers for
+/// VFIO device wrappers that are either backed by a legacy VfioContainer or
+/// a VFIO cdev device using iommufd.
+pub trait VfioOps: Any + Send + Sync {
+    /// Map a region of user space memory (e.g. guest memory) into an IO
+    /// address space managed by IOMMU hardware to enable DMA for
+    /// associated VFIO devices
+    ///
+    /// # Parameters
+    ///
+    /// * iova: IO virtual address to mapping the memory.
+    /// * size: size of the memory region.
+    /// * user_addr: host virtual address for the guest memory region to map.
+    ///
+    /// # Safety
+    ///
+    /// Until [`Self::vfio_dma_unmap`] is successfully called with identical
+    /// values for iova and size, or until the entire range of
+    /// `[user_addr..user_addr+size)` has been unmapped with successful calls
+    /// to `munmap` or replaced with successful calls to `mmap(MAP_FIXED)`,
+    /// the only safe uses of the address range `[user_addr..user_addr+size)` are:
+    ///
+    /// - Atomic and/or volatile operations on raw pointers.
+    /// - Sharing the underlying storage with another process or a guest VM.
+    /// - Passing a pointer to the memory to a system call (such as `read()`
+    ///   or `write()`) that is safe regardless of the memory's contents.
+    /// - Passing a raw pointer to functions that only do one of the above things.
+    ///
+    /// In particular, creating a Rust reference to this memory is instant undefined behavior
+    /// due to the Rust aliasing rules.  It is also undefined behavior to call this function if
+    /// a Rust reference to this memory is live.  This is because the device has
+    /// concurrent read and write access to the memory via DMA.  Therefore, the
+    /// memory may be read or written by the device at any time without synchronization.
+    unsafe fn vfio_dma_map(&self, _iova: u64, _size: usize, _user_addr: *mut u8) -> Result<()> {
+        unimplemented!()
+    }
+
+    /// Unmap a region of user space memory (e.g. guest memory) from an IO
+    /// address space managed by IOMMU hardware to disable DMA for
+    /// associated VFIO devices
+    ///
+    /// # Parameters
+    /// * iova: IO virtual address to unmap the memory.
+    /// * size: size of the memory region.
+    fn vfio_dma_unmap(&self, _iova: u64, _size: usize) -> Result<()> {
+        unimplemented!()
+    }
+
+    /// Downcast to the underlying vfio wrapper type
+    fn as_any(&self) -> &dyn Any {
+        unimplemented!()
+    }
+}
+
+struct VfioCommon {
+    #[allow(dead_code)]
+    device_fd: Option<VfioContainerDeviceHandle>,
+}
+
+impl VfioCommon {
+    #[cfg(all(any(feature = "kvm", feature = "mshv"), not(test)))]
+    fn device_set_fd(&self, dev_fd: RawFd, add: bool) -> Result<()> {
+        let dev_fd_ptr = &dev_fd as *const i32;
+
+        if let Some(device_fd) = self.device_fd.as_ref() {
+            match &device_fd.0 {
+                #[cfg(feature = "kvm")]
+                DeviceFdInner::Kvm(fd) => {
+                    let flag = if add {
+                        KVM_DEV_VFIO_FILE_ADD
+                    } else {
+                        KVM_DEV_VFIO_FILE_DEL
+                    };
+                    let dev_attr = kvm_device_attr {
+                        flags: 0,
+                        group: KVM_DEV_VFIO_FILE,
+                        attr: u64::from(flag),
+                        addr: dev_fd_ptr as u64,
+                    };
+                    fd.set_device_attr(&dev_attr)
+                        .map_err(|e| VfioError::SetDeviceAttr(Error::new(e.errno())))
+                }
+                #[cfg(feature = "mshv")]
+                DeviceFdInner::Mshv(fd) => {
+                    let flag = if add {
+                        MSHV_DEV_VFIO_FILE_ADD
+                    } else {
+                        MSHV_DEV_VFIO_FILE_DEL
+                    };
+                    let dev_attr = mshv_device_attr {
+                        flags: 0,
+                        group: MSHV_DEV_VFIO_FILE,
+                        attr: u64::from(flag),
+                        addr: dev_fd_ptr as u64,
+                    };
+                    fd.set_device_attr(&dev_attr)
+                        .map_err(|e| VfioError::SetDeviceAttr(Error::new(e.errno())))
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "vfio_cdev", test))]
+    fn device_set_fd(&self, _dev_fd: RawFd, _add: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A safe wrapper over a VFIO container object.
+///
+/// A VFIO container represents an IOMMU domain, or a set of IO virtual address translation tables.
+/// On its own, the container provides little functionality, with all but a couple version and
+/// extension query interfaces locked away. The user needs to add a group into the container for
+/// the next level of functionality. After some groups are associated with a container, the user
+/// can query and set the IOMMU backend, and then build IOVA mapping to access memory.
+///
+/// Multiple VFIO groups may be associated with the same VFIO container to share the underline
+/// address translation mapping tables.
+pub struct VfioContainer {
+    pub(crate) container: File,
+    pub(crate) groups: Mutex<HashMap<u32, Arc<VfioGroup>>>,
+    #[allow(dead_code)]
+    common: VfioCommon,
+}
+
+impl VfioContainer {
+    /// Create a container wrapper object.
+    ///
+    /// # Arguments
+    /// * `device_fd`: An optional file handle of the hypervisor VFIO device.
+    pub fn new(device_fd: Option<VfioContainerDeviceHandle>) -> Result<Self> {
+        let container = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/vfio/vfio")
+            .map_err(VfioError::OpenContainer)?;
+
+        let container = VfioContainer {
+            container,
+            common: VfioCommon { device_fd },
+            groups: Mutex::new(HashMap::new()),
+        };
+        container.check_api_version()?;
+        container.check_extension(VFIO_TYPE1v2_IOMMU)?;
+
+        Ok(container)
+    }
+
+    fn check_api_version(&self) -> Result<()> {
+        let version = vfio_syscall::check_api_version(self);
+        if version as u32 != VFIO_API_VERSION {
+            return Err(VfioError::VfioApiVersion);
+        }
+        Ok(())
+    }
+
+    fn check_extension(&self, val: u32) -> Result<()> {
+        if val != VFIO_TYPE1_IOMMU && val != VFIO_TYPE1v2_IOMMU {
+            return Err(VfioError::VfioInvalidType);
+        }
+
+        let ret = vfio_syscall::check_extension(self, val)?;
+        if ret != 1 {
+            return Err(VfioError::VfioExtension);
+        }
+
+        Ok(())
+    }
+
+    fn set_iommu(&self, val: u32) -> Result<()> {
+        if val != VFIO_TYPE1_IOMMU && val != VFIO_TYPE1v2_IOMMU {
+            return Err(VfioError::VfioInvalidType);
+        }
+
+        vfio_syscall::set_iommu(self, val)
+    }
+
+    fn get_group(&self, group_id: u32) -> Result<Arc<VfioGroup>> {
+        self.get_group_at(group_id, None)
+    }
+
+    /// Hermes: look up a group by key, opening it at `group_path` (instead of
+    /// `/dev/vfio/<id>`) the first time it is seen.
+    fn get_group_at(&self, group_id: u32, group_path: Option<&Path>) -> Result<Arc<VfioGroup>> {
+        // Safe because there's no legal way to break the lock.
+        let mut hash = self.groups.lock().unwrap();
+        if let Some(entry) = hash.get(&group_id) {
+            return Ok(entry.clone());
+        }
+
+        let group = Arc::new(match group_path {
+            Some(path) => VfioGroup::new_at(group_id, path)?,
+            None => VfioGroup::new(group_id)?,
+        });
+
+        // Bind the new group object to the container.
+        vfio_syscall::set_group_container(&group, self)?;
+
+        // Initialize the IOMMU backend driver after binding the first group object.
+        if hash.is_empty() {
+            if let Err(e) = self.set_iommu(VFIO_TYPE1v2_IOMMU) {
+                let _ = vfio_syscall::unset_group_container(&group, self);
+                return Err(e);
+            }
+        }
+
+        // Add the new group object to the hypervisor driver.
+        #[cfg(any(feature = "kvm", feature = "mshv"))]
+        if let Err(e) = self.device_add_group(&group) {
+            let _ = vfio_syscall::unset_group_container(&group, self);
+            return Err(e);
+        }
+
+        hash.insert(group_id, group.clone());
+
+        Ok(group)
+    }
+
+    fn put_group(&self, group: Arc<VfioGroup>) {
+        // Safe because there's no legal way to break the lock.
+        let mut hash = self.groups.lock().unwrap();
+
+        // Clean up the group when the last user releases reference to the group, three reference
+        // count for:
+        // - one reference cloned in VfioDevice.drop() and passed into here
+        // - one reference held by the groups hashmap
+        if Arc::strong_count(&group) == 2 {
+            #[cfg(any(feature = "kvm", feature = "mshv"))]
+            match self.device_del_group(&group) {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Could not delete VFIO group: {e:?}");
+                    return;
+                }
+            }
+            if vfio_syscall::unset_group_container(&group, self).is_err() {
+                error!("Could not unbind VFIO group: {:?}", group.id());
+                return;
+            }
+            hash.remove(&group.id());
+        }
+    }
+
+    /// Map a region of user space memory (e.g. guest memory) into an IO
+    /// address space managed by IOMMU hardware to enable DMA for
+    /// associated VFIO devices
+    ///
+    /// # Parameters
+    ///
+    /// * iova: IO virtual address to mapping the memory.
+    /// * size: size of the memory region.
+    /// * user_addr: host virtual address for the guest memory region to map.
+    ///
+    /// # Safety
+    ///
+    /// Until [`Self::vfio_dma_unmap`] is successfully called with identical
+    /// values for iova and size, or until the entire range of
+    /// `[user_addr..user_addr+size)` has been unmapped with successful calls
+    /// to `munmap` or replaced with successful calls to `mmap(MAP_FIXED)`,
+    /// the only safe uses of the address range `[user_addr..user_addr+size)` are:
+    ///
+    /// - Atomic and/or volatile operations on raw pointers.
+    /// - Sharing the underlying storage with another process or a guest VM.
+    /// - Passing a pointer to the memory to a system call (such as `read()`
+    ///   or `write()`) that is safe regardless of the memory's contents.
+    /// - Passing a raw pointer to functions that only do one of the above things.
+    ///
+    /// In particular, creating a Rust reference to this memory is instant undefined behavior
+    /// due to the Rust aliasing rules.  It is also undefined behavior to call this function if
+    /// a Rust reference to this memory is live.  This is because the device has
+    /// concurrent read and write access to the memory via DMA.  Therefore, the
+    /// memory may be read or written by the device at any time without synchronization.
+    pub unsafe fn vfio_dma_map(&self, iova: u64, size: usize, user_addr: *mut u8) -> Result<()> {
+        const _: () = assert!(mem::size_of::<u64>() >= mem::size_of::<*mut u8>());
+        const _: () = assert!(mem::size_of::<u64>() >= mem::size_of::<usize>());
+        let dma_map = vfio_iommu_type1_dma_map {
+            argsz: mem::size_of::<vfio_iommu_type1_dma_map>() as u32,
+            flags: VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+            vaddr: (user_addr as usize).try_into().unwrap(),
+            iova,
+            size: size.try_into().unwrap(),
+        };
+
+        // SAFETY: Caller is responsible for upholding preconditions.
+        unsafe { vfio_syscall::map_dma(self, &dma_map) }
+    }
+
+    /// Unmap a region of user space memory (e.g. guest memory) from an IO
+    /// address space managed by IOMMU hardware to disable DMA for
+    /// associated VFIO devices
+    ///
+    /// # Parameters
+    /// * iova: IO virtual address to unmap the memory.
+    /// * size: size of the memory region.
+    pub fn vfio_dma_unmap(&self, iova: u64, size: usize) -> Result<()> {
+        let mut dma_unmap = vfio_iommu_type1_dma_unmap {
+            argsz: mem::size_of::<vfio_iommu_type1_dma_unmap>() as u32,
+            flags: 0,
+            iova,
+            size: size.try_into().unwrap(),
+            ..Default::default()
+        };
+
+        vfio_syscall::unmap_dma(self, &mut dma_unmap)?;
+        if dma_unmap.size != u64::try_from(size).unwrap() {
+            return Err(VfioError::InvalidDmaUnmapSize);
+        }
+
+        Ok(())
+    }
+
+    /// Add all guest memory regions into the vfio container's iommu table.
+    ///
+    /// # Parameters
+    /// * mem: pinned guest memory which could be accessed by devices binding to the container.
+    ///
+    /// # Safety
+    ///
+    /// Each of the memory regions must uphold the safety invariants of [`Self::vfio_dma_map`].
+    /// Additionally, the [`GuestMemoryBackend`] implementation must be well-behaved and uphold
+    /// the contracts in its documentation.
+    ///
+    /// If this function fails (returning [`core::result::Result::Err`]) there is no way to know
+    /// which parts of the guest memory were successfully mapped.  The only safe action to take
+    /// to avoid undefined guest behavior is to crash the guest.
+    ///
+    /// # Errors
+    ///
+    /// Fails if any of the mapping operations fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the length of one of the regions overflows `usize`.
+    pub unsafe fn vfio_map_guest_memory<M: GuestMemoryBackend>(&self, mem: &M) -> Result<()> {
+        mem.iter().try_for_each(|region| {
+            let host_addr = region
+                .get_host_address(MemoryRegionAddress(0))
+                .map_err(|_| VfioError::GetHostAddress)?;
+            // SAFETY: GuestMemoryBackend guarantees the requirements
+            // are upheld.
+            unsafe {
+                self.vfio_dma_map(
+                    region.start_addr().raw_value(),
+                    region.len().try_into().unwrap(),
+                    host_addr,
+                )
+            }
+        })
+    }
+
+    /// Remove all guest memory regions from the vfio container's iommu table.
+    ///
+    /// The vfio kernel driver and device hardware can't access this guest memory after
+    /// the function returns successfully, **provided that the following precondition holds**.
+    ///
+    /// # Precondition
+    ///
+    /// A previous call to [`Self::vfio_map_guest_memory`] must have succeeded, and iterating
+    /// over the regions in the [`GuestMemoryBackend`] must produce the same values it did in
+    /// the past.  This latter contract will be upheld by a correct [`GuestMemoryBackend`]
+    /// implementation, but [`GuestMemoryBackend`] is a safe trait and so unsafe code must not
+    /// rely on this unless it is explicitly part of a safety contract.
+    ///
+    /// # Parameters
+    /// * mem: pinned guest memory which could be accessed by devices binding to the container.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the length of any of the regions overflows `usize`.  That should have been
+    /// caught by [`Self::vfio_map_guest_memory`], so it indicates a bogus
+    /// [`GuestMemoryBackend`] implementation.
+    pub fn vfio_unmap_guest_memory<M: GuestMemoryBackend>(&self, mem: &M) -> Result<()> {
+        mem.iter().try_for_each(|region| {
+            self.vfio_dma_unmap(
+                region.start_addr().raw_value(),
+                region.len().try_into().unwrap(),
+            )
+        })
+    }
+
+    /// Add a device to a VFIO group
+    ///
+    /// The VFIO device fd should have been set.
+    ///
+    /// # Parameters
+    /// * group: target VFIO group
+    #[cfg(all(any(feature = "kvm", feature = "mshv"), not(test)))]
+    fn device_add_group(&self, group: &VfioGroup) -> Result<()> {
+        self.common.device_set_fd(group.as_raw_fd(), true)
+    }
+
+    /// Delete a device from a VFIO group
+    ///
+    /// The VFIO device fd should have been set.
+    ///
+    /// # Parameters
+    /// * group: target VFIO group
+    #[cfg(all(any(feature = "kvm", feature = "mshv"), not(test)))]
+    fn device_del_group(&self, group: &VfioGroup) -> Result<()> {
+        self.common.device_set_fd(group.as_raw_fd(), false)
+    }
+
+    #[cfg(test)]
+    fn device_add_group(&self, _group: &VfioGroup) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn device_del_group(&self, _group: &VfioGroup) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl AsRawFd for VfioContainer {
+    fn as_raw_fd(&self) -> RawFd {
+        self.container.as_raw_fd()
+    }
+}
+
+impl VfioOps for VfioContainer {
+    /// Map a region of user space memory (e.g. guest memory) into an IO
+    /// address space managed by IOMMU hardware to enable DMA for
+    /// associated VFIO devices
+    ///
+    /// # Parameters
+    ///
+    /// * iova: IO virtual address to mapping the memory.
+    /// * size: size of the memory region.
+    /// * user_addr: host virtual address for the guest memory region to map.
+    ///
+    /// # Safety
+    ///
+    /// Until [`Self::vfio_dma_unmap`] is successfully called with identical
+    /// values for iova and size, or until the entire range of `[user_addr..user_addr+size)`
+    /// has been unmapped with successful calls to `munmap` or replaced with successful calls
+    /// to `mmap(MAP_FIXED)`, the only safe uses of the address range
+    /// `[user_addr..user_addr+size)` are:
+    ///
+    /// - Atomic and/or volatile operations on raw pointers.
+    /// - Sharing the underlying storage with another process or a guest VM.
+    /// - Passing a pointer to the memory to a system call (such as `read()`
+    ///   or `write()`) that is safe regardless of the memory's contents.
+    /// - Passing a raw pointer to functions that only do one of the above things.
+    ///
+    /// In particular, creating a Rust reference to this memory is instant undefined behavior
+    /// due to the Rust aliasing rules.  It is also undefined behavior to call this function if
+    /// a Rust reference to this memory is live.  This is because the device has
+    /// concurrent read and write access to the memory via DMA.  Therefore, the
+    /// memory may be read or written by the device at any time without synchronization.
+    unsafe fn vfio_dma_map(&self, iova: u64, size: usize, user_addr: *mut u8) -> Result<()> {
+        self.vfio_dma_map(iova, size, user_addr)
+    }
+
+    /// Unmap a region of user space memory (e.g. guest memory) from an IO
+    /// address space managed by IOMMU hardware to disable DMA for
+    /// associated VFIO devices
+    ///
+    /// # Parameters
+    /// * iova: IO virtual address to unmap the memory.
+    /// * size: size of the memory region.
+    fn vfio_dma_unmap(&self, iova: u64, size: usize) -> Result<()> {
+        self.vfio_dma_unmap(iova, size)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A safe wrapper over a VFIO group object.
+///
+/// The Linux VFIO frameworks supports multiple devices per group, and multiple groups per
+/// container. But current implementation assumes there's only one device per group to simplify
+/// implementation. With such an assumption, the `VfioGroup` becomes an internal implementation
+/// details.
+pub struct VfioGroup {
+    pub(crate) id: u32,
+    pub(crate) group: File,
+}
+
+impl VfioGroup {
+    #[cfg(not(test))]
+    fn open_group_file(id: u32) -> Result<File> {
+        let group_path = Path::new("/dev/vfio").join(id.to_string());
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(group_path)
+            .map_err(|e| VfioError::OpenGroup(e, id.to_string()))
+    }
+
+    /// Create a new VfioGroup object.
+    ///
+    /// # Parameters
+    /// * `id`: ID(index) of the VFIO group file.
+    fn new(id: u32) -> Result<Self> {
+        let group = Self::open_group_file(id)?;
+        let mut group_status = vfio_group_status {
+            argsz: mem::size_of::<vfio_group_status>() as u32,
+            flags: 0,
+        };
+        vfio_syscall::get_group_status(&group, &mut group_status)?;
+        if group_status.flags != VFIO_GROUP_FLAGS_VIABLE {
+            return Err(VfioError::GroupViable);
+        }
+
+        Ok(VfioGroup { id, group })
+    }
+
+    /// Hermes: open the group node at an explicit path. `id` is only the
+    /// container's lookup key; it need not be the IOMMU group number.
+    fn new_at(id: u32, group_path: &Path) -> Result<Self> {
+        let group = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(group_path)
+            .map_err(|e| VfioError::OpenGroup(e, group_path.display().to_string()))?;
+        let mut group_status = vfio_group_status {
+            argsz: mem::size_of::<vfio_group_status>() as u32,
+            flags: 0,
+        };
+        vfio_syscall::get_group_status(&group, &mut group_status)?;
+        if group_status.flags != VFIO_GROUP_FLAGS_VIABLE {
+            return Err(VfioError::GroupViable);
+        }
+
+        Ok(VfioGroup { id, group })
+    }
+
+    fn id(&self) -> u32 {
+        self.id
+    }
+
+    fn get_device(&self, name: &Path) -> Result<VfioDeviceInfo> {
+        let uuid_osstr = name.file_name().ok_or(VfioError::InvalidPath)?;
+        let uuid_str = uuid_osstr.to_str().ok_or(VfioError::InvalidPath)?;
+        self.get_device_by_name(uuid_str)
+    }
+
+    /// Hermes: get a device of this group by its name (a PCI address or an
+    /// mdev UUID).
+    fn get_device_by_name(&self, name: &str) -> Result<VfioDeviceInfo> {
+        let path: CString = CString::new(name.as_bytes()).map_err(|_| VfioError::InvalidPath)?;
+        let device = vfio_syscall::get_group_device_fd(self, &path)?;
+        let dev_info = VfioDeviceInfo::get_device_info(&device)?;
+
+        Ok(VfioDeviceInfo::new(device, &dev_info))
+    }
+}
+
+impl AsRawFd for VfioGroup {
+    fn as_raw_fd(&self) -> RawFd {
+        self.group.as_raw_fd()
+    }
+}
+
+/// A safe wrapper over vfio devices backed by vfio cdev using iommufd
+#[cfg(feature = "vfio_cdev")]
+pub struct VfioIommufd {
+    pub(crate) iommufd: Arc<IommuFd>,
+    pub(crate) ioas_id: u32,
+    // True when we allocated the IOAS and must destroy it on drop
+    owns_ioas: bool,
+    common: VfioCommon,
+}
+
+#[cfg(feature = "vfio_cdev")]
+impl VfioIommufd {
+    /// Create a wrapper object for vfio devices backed by vfio cdev
+    /// using iommufd.
+    ///
+    /// # Arguments
+    /// * `iommufd`: the iommufd to be bound with the VFIO device
+    /// * `ioas_id`: the IOAS id to be bound with the VFIO device
+    /// * `device_fd`: An optional file handle of the hypervisor VFIO device.
+    pub fn new(
+        iommufd: Arc<IommuFd>,
+        ioas_id: Option<u32>,
+        device_fd: Option<VfioContainerDeviceHandle>,
+    ) -> Result<Self> {
+        let owns_ioas = ioas_id.is_none();
+        let ioas_id = match ioas_id {
+            Some(ioas_id) => ioas_id,
+            None => {
+                let mut alloc_data = iommu_ioas_alloc {
+                    size: mem::size_of::<iommu_ioas_alloc>() as u32,
+                    flags: 0,
+                    out_ioas_id: 0,
+                };
+
+                iommufd
+                    .as_ref()
+                    .alloc_iommu_ioas(&mut alloc_data)
+                    .map_err(VfioError::NewVfioIommufd)?;
+
+                alloc_data.out_ioas_id
+            }
+        };
+
+        let vfio_iommufd = VfioIommufd {
+            iommufd,
+            ioas_id,
+            owns_ioas,
+            common: VfioCommon { device_fd },
+        };
+
+        Ok(vfio_iommufd)
+    }
+
+    /// Map a region of user space memory (e.g. guest memory) into an IO
+    /// address space managed by IOMMU hardware to enable DMA for
+    /// associated VFIO devices
+    ///
+    /// # Parameters
+    ///
+    /// * iova: IO virtual address to mapping the memory.
+    /// * size: size of the memory region.
+    /// * user_addr: host virtual address for the guest memory region to map.
+    ///
+    /// # Safety
+    ///
+    /// Until [`Self::vfio_dma_unmap`] is successfully called with identical
+    /// values for iova and size, or until the entire range of `[user_addr..user_addr+size)`
+    /// has been unmapped with successful calls to `munmap` or replaced with successful calls
+    /// to `mmap(MAP_FIXED)`, the only safe uses of the address range
+    /// `[user_addr..user_addr+size)` are:
+    ///
+    /// - Atomic and/or volatile operations on raw pointers.
+    /// - Sharing the underlying storage with another process or a guest VM.
+    /// - Passing a pointer to the memory to a system call (such as `read()`
+    ///   or `write()`) that is safe regardless of the memory's contents.
+    /// - Passing a raw pointer to functions that only do one of the above things.
+    ///
+    /// In particular, creating a Rust reference to this memory is instant undefined behavior
+    /// due to the Rust aliasing rules.  It is also undefined behavior to call this function if
+    /// a Rust reference to this memory is live.
+    #[allow(unused_unsafe)] // underlying API is unsound
+    pub unsafe fn vfio_dma_map(&self, iova: u64, length: usize, user_addr: *mut u8) -> Result<()> {
+        let dma_map = iommu_ioas_map {
+            size: mem::size_of::<iommu_ioas_map>() as u32,
+            flags: iommufd_ioas_map_flags_IOMMU_IOAS_MAP_READABLE
+                | iommufd_ioas_map_flags_IOMMU_IOAS_MAP_WRITEABLE
+                | iommufd_ioas_map_flags_IOMMU_IOAS_MAP_FIXED_IOVA,
+            ioas_id: self.ioas_id,
+            __reserved: 0,
+            user_va: user_addr as _,
+            length: length.try_into().unwrap(),
+            iova,
+        };
+
+        self.iommufd
+            .map_iommu_ioas(&dma_map)
+            .map_err(VfioError::IommufdIoctlError)
+    }
+
+    /// Unmap a region of user space memory (e.g. guest memory) from an IO
+    /// address space managed by IOMMU hardware to disable DMA for
+    /// associated VFIO devices
+    ///
+    /// # Parameters
+    /// * iova: IO virtual address to unmap the memory.
+    /// * size: size of the memory region.
+    pub fn vfio_dma_unmap(&self, iova: u64, length: usize) -> Result<()> {
+        let mut dma_unmap = iommu_ioas_unmap {
+            size: mem::size_of::<iommu_ioas_unmap>() as u32,
+            ioas_id: self.ioas_id,
+            iova,
+            length: u64::try_from(length).unwrap(),
+        };
+
+        self.iommufd
+            .unmap_iommu_ioas(&mut dma_unmap)
+            .map_err(VfioError::IommufdIoctlError)?;
+
+        if dma_unmap.length != u64::try_from(length).unwrap() {
+            return Err(VfioError::InvalidDmaUnmapSize);
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "vfio_cdev")]
+impl Drop for VfioIommufd {
+    fn drop(&mut self) {
+        // Destroy the IOAS we allocated so a long-lived (externally
+        // supplied) iommufd does not accumulate orphan IOAS objects.
+        // By the time Drop runs, the `Arc<dyn VfioOps>` chain has
+        // already dropped every `VfioDevice`, each of which detached
+        // itself from this IOAS, so the kernel refcount is back to 1
+        // and IOMMU_DESTROY won't return -EBUSY. The destroy implicitly
+        // unmaps any remaining mappings too.
+        if self.owns_ioas {
+            if let Err(e) = self.iommufd.destroy_iommu_object(self.ioas_id) {
+                error!(
+                    "Failed to destroy IOAS {} on VfioIommufd drop: {}",
+                    self.ioas_id, e
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "vfio_cdev")]
+impl VfioOps for VfioIommufd {
+    /// Map a region of user space memory (e.g. guest memory) into an IO
+    /// address space managed by IOMMU hardware to enable DMA for
+    /// associated VFIO devices
+    ///
+    /// # Parameters
+    ///
+    /// * iova: IO virtual address to mapping the memory.
+    /// * size: size of the memory region.
+    /// * user_addr: host virtual address for the guest memory region to map.
+    ///
+    /// # Safety
+    ///
+    /// Until [`Self::vfio_dma_unmap`] is successfully called with identical
+    /// values for iova and size, or until the entire range of `[user_addr..user_addr+size)`
+    /// has been unmapped with successful calls to `munmap` or replaced with successful calls
+    /// to `mmap(MAP_FIXED)`, the only safe uses of the address range
+    /// `[user_addr..user_addr+size)` are:
+    ///
+    /// - Atomic and/or volatile operations on raw pointers.
+    /// - Sharing the underlying storage with another process or a guest VM.
+    /// - Passing a pointer to the memory to a system call (such as `read()`
+    ///   or `write()`) that is safe regardless of the memory's contents.
+    /// - Passing a raw pointer to functions that only do one of the above things.
+    ///
+    /// In particular, creating a Rust reference to this memory is instant undefined behavior
+    /// due to the Rust aliasing rules.  It is also undefined behavior to call this function if
+    /// a Rust reference to this memory is live.
+    unsafe fn vfio_dma_map(&self, iova: u64, size: usize, user_addr: *mut u8) -> Result<()> {
+        self.vfio_dma_map(iova, size, user_addr)
+    }
+
+    fn vfio_dma_unmap(&self, iova: u64, size: usize) -> Result<()> {
+        self.vfio_dma_unmap(iova, size)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Represent one area of the sparse mmap
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VfioRegionSparseMmapArea {
+    /// Offset of mmap'able area within region
+    pub offset: u64,
+    /// Size of mmap'able area
+    pub size: u64,
+}
+
+/// List of sparse mmap areas
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VfioRegionInfoCapSparseMmap {
+    /// List of areas
+    pub areas: Vec<VfioRegionSparseMmapArea>,
+}
+
+/// Represent a specific device by providing type and subtype
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VfioRegionInfoCapType {
+    /// Device type
+    pub type_: u32,
+    /// Device subtype
+    pub subtype: u32,
+}
+
+/// Carry NVLink SSA TGT information
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VfioRegionInfoCapNvlink2Ssatgt {
+    /// TGT value
+    pub tgt: u64,
+}
+
+/// Carry NVLink link speed information
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VfioRegionInfoCapNvlink2Lnkspd {
+    /// Link speed value
+    pub link_speed: u32,
+}
+
+/// List of capabilities that can be related to a region.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VfioRegionInfoCap {
+    /// Sparse memory mapping type
+    SparseMmap(VfioRegionInfoCapSparseMmap),
+    /// Capability holding type and subtype
+    Type(VfioRegionInfoCapType),
+    /// Indicate if the region is mmap'able with the presence of MSI-X region
+    MsixMappable,
+    /// NVLink SSA TGT
+    Nvlink2Ssatgt(VfioRegionInfoCapNvlink2Ssatgt),
+    /// NVLink Link Speed
+    Nvlink2Lnkspd(VfioRegionInfoCapNvlink2Lnkspd),
+}
+
+/// Information about VFIO MMIO region.
+#[derive(Clone, Debug)]
+pub struct VfioRegion {
+    pub(crate) flags: u32,
+    pub(crate) size: u64,
+    pub(crate) offset: u64,
+    pub(crate) caps: Vec<VfioRegionInfoCap>,
+}
+
+/// Information about VFIO interrupts.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VfioIrq {
+    /// Flags for irq.
+    pub flags: u32,
+    /// Staring index.
+    pub index: u32,
+    /// Number interrupts.
+    pub count: u32,
+}
+
+pub(crate) struct VfioDeviceInfo {
+    device: File,
+    flags: u32,
+    num_regions: u32,
+    num_irqs: u32,
+}
+
+impl VfioDeviceInfo {
+    #[inline]
+    /// Get device type from device_info flags.
+    ///
+    /// # Parameters
+    /// * `flags`: flags field in device_info structure.
+    fn get_device_type(flags: &u32) -> u32 {
+        // There may be more types of device here later according to vfio_bindings.
+        let device_type: u32 = VFIO_DEVICE_FLAGS_PCI
+            | VFIO_DEVICE_FLAGS_PLATFORM
+            | VFIO_DEVICE_FLAGS_AMBA
+            | VFIO_DEVICE_FLAGS_CCW
+            | VFIO_DEVICE_FLAGS_AP;
+
+        flags & device_type
+    }
+
+    fn get_device_info(device: &File) -> Result<vfio_device_info> {
+        let mut dev_info = vfio_device_info {
+            argsz: mem::size_of::<vfio_device_info>() as u32,
+            flags: 0,
+            num_regions: 0,
+            num_irqs: 0,
+            cap_offset: 0,
+            pad: 0,
+        };
+        vfio_syscall::get_device_info(device, &mut dev_info)?;
+        match VfioDeviceInfo::get_device_type(&dev_info.flags) {
+            VFIO_DEVICE_FLAGS_PLATFORM => {}
+            VFIO_DEVICE_FLAGS_PCI => {
+                if dev_info.num_regions < VFIO_PCI_CONFIG_REGION_INDEX + 1
+                    || dev_info.num_irqs < VFIO_PCI_MSIX_IRQ_INDEX + 1
+                {
+                    return Err(VfioError::VfioDeviceGetInfoPCI);
+                }
+            }
+            _ => {
+                return Err(VfioError::VfioDeviceGetInfoOther);
+            }
+        }
+
+        Ok(dev_info)
+    }
+
+    fn new(device: File, dev_info: &vfio_device_info) -> Self {
+        VfioDeviceInfo {
+            device,
+            flags: dev_info.flags,
+            num_regions: dev_info.num_regions,
+            num_irqs: dev_info.num_irqs,
+        }
+    }
+
+    fn get_irqs(&self) -> Result<HashMap<u32, VfioIrq>> {
+        let mut irqs: HashMap<u32, VfioIrq> = HashMap::new();
+
+        for index in 0..self.num_irqs {
+            let mut irq_info = vfio_irq_info {
+                argsz: mem::size_of::<vfio_irq_info>() as u32,
+                flags: 0,
+                index,
+                count: 0,
+            };
+
+            if vfio_syscall::get_device_irq_info(self, &mut irq_info).is_err() {
+                warn!("Could not get VFIO IRQ info for index {index:}");
+                continue;
+            }
+
+            let irq = VfioIrq {
+                flags: irq_info.flags,
+                index,
+                count: irq_info.count,
+            };
+
+            debug!("IRQ #{index}");
+            debug!("\tflag 0x{:x}", irq.flags);
+            debug!("\tindex {}", irq.index);
+            debug!("\tcount {}", irq.count);
+            irqs.insert(index, irq);
+        }
+
+        Ok(irqs)
+    }
+
+    fn get_region_map(
+        &self,
+        region: &mut VfioRegion,
+        region_info: &vfio_region_info,
+    ) -> Result<()> {
+        let region_info_size: u32 = mem::size_of::<vfio_region_info>() as u32;
+
+        if region_info.flags & VFIO_REGION_INFO_FLAG_CAPS == 0
+            || region_info.argsz <= region_info_size
+        {
+            // There is not capabilities information for that region, we can just return.
+            return Ok(());
+        }
+
+        // There is a capability information for that region, we have to call
+        // VFIO_DEVICE_GET_REGION_INFO with a vfio_region_with_cap structure and the hinted size.
+        let mut region_with_cap = vfio_region_info_with_cap::from_region_info(region_info);
+        vfio_syscall::get_device_region_info_cap(self, &mut region_with_cap)?;
+
+        // region_with_cap[0] may contain different types of structure depending on the capability
+        // type, but all of them begin with vfio_info_cap_header in order to identify the capability
+        // type, version and if there's another capability after this one.
+        // It is safe to convert region_with_cap[0] with an offset of cap_offset into
+        // vfio_info_cap_header pointer and access its elements, as long as cap_offset is greater
+        // than region_info_size.
+        //
+        // Safety: following code is safe because we trust data returned by the kernel.
+        if region_with_cap[0].region_info.cap_offset >= region_info_size {
+            let mut next_cap_offset = region_with_cap[0].region_info.cap_offset;
+            let info_ptr = &region_with_cap[0] as *const vfio_region_info_with_cap as *const u8;
+
+            while next_cap_offset >= region_info_size {
+                // SAFETY: data structure returned by kernel is trusted.
+                let cap_header = unsafe {
+                    *(info_ptr.offset(next_cap_offset as isize) as *const vfio_info_cap_header)
+                };
+
+                match u32::from(cap_header.id) {
+                    VFIO_REGION_INFO_CAP_SPARSE_MMAP => {
+                        // SAFETY: data structure returned by kernel is trusted.
+                        let sparse_mmap = unsafe {
+                            info_ptr.offset(next_cap_offset as isize)
+                                as *const vfio_region_info_cap_sparse_mmap
+                        };
+                        // SAFETY: data structure returned by kernel is trusted.
+                        let nr_areas = unsafe { (*sparse_mmap).nr_areas };
+                        // SAFETY: data structure returned by kernel is trusted.
+                        let areas = unsafe { (*sparse_mmap).areas.as_slice(nr_areas as usize) };
+
+                        let cap = VfioRegionInfoCapSparseMmap {
+                            areas: areas
+                                .iter()
+                                .map(|a| VfioRegionSparseMmapArea {
+                                    offset: a.offset,
+                                    size: a.size,
+                                })
+                                .collect(),
+                        };
+                        region.caps.push(VfioRegionInfoCap::SparseMmap(cap));
+                    }
+                    VFIO_REGION_INFO_CAP_TYPE => {
+                        // SAFETY: data structure returned by kernel is trusted.
+                        let type_ = unsafe {
+                            *(info_ptr.offset(next_cap_offset as isize)
+                                as *const vfio_region_info_cap_type)
+                        };
+                        let cap = VfioRegionInfoCapType {
+                            type_: type_.type_,
+                            subtype: type_.subtype,
+                        };
+                        region.caps.push(VfioRegionInfoCap::Type(cap));
+                    }
+                    VFIO_REGION_INFO_CAP_MSIX_MAPPABLE => {
+                        region.caps.push(VfioRegionInfoCap::MsixMappable);
+                    }
+                    VFIO_REGION_INFO_CAP_NVLINK2_SSATGT => {
+                        // SAFETY: data structure returned by kernel is trusted.
+                        let nvlink2_ssatgt = unsafe {
+                            *(info_ptr.offset(next_cap_offset as isize)
+                                as *const vfio_region_info_cap_nvlink2_ssatgt)
+                        };
+                        let cap = VfioRegionInfoCapNvlink2Ssatgt {
+                            tgt: nvlink2_ssatgt.tgt,
+                        };
+                        region.caps.push(VfioRegionInfoCap::Nvlink2Ssatgt(cap));
+                    }
+                    VFIO_REGION_INFO_CAP_NVLINK2_LNKSPD => {
+                        // SAFETY: data structure returned by kernel is trusted.
+                        let nvlink2_lnkspd = unsafe {
+                            *(info_ptr.offset(next_cap_offset as isize)
+                                as *const vfio_region_info_cap_nvlink2_lnkspd)
+                        };
+                        let cap = VfioRegionInfoCapNvlink2Lnkspd {
+                            link_speed: nvlink2_lnkspd.link_speed,
+                        };
+                        region.caps.push(VfioRegionInfoCap::Nvlink2Lnkspd(cap));
+                    }
+                    _ => {}
+                }
+
+                next_cap_offset = cap_header.next;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_regions(&self) -> Result<Vec<VfioRegion>> {
+        let mut regions: Vec<VfioRegion> = Vec::new();
+
+        for i in VFIO_PCI_BAR0_REGION_INDEX..self.num_regions {
+            let argsz: u32 = mem::size_of::<vfio_region_info>() as u32;
+            let mut reg_info = vfio_region_info {
+                argsz,
+                flags: 0,
+                index: i,
+                cap_offset: 0,
+                size: 0,
+                offset: 0,
+            };
+
+            if let Err(e) = vfio_syscall::get_device_region_info(self, &mut reg_info) {
+                match e {
+                    // Non-VGA devices do not have the VGA region,
+                    // the kernel indicates this by returning -EINVAL,
+                    // and it's not an error.
+                    VfioError::VfioDeviceGetRegionInfo(e)
+                        if e.errno() == libc::EINVAL && i == VFIO_PCI_VGA_REGION_INDEX =>
+                    {
+                        continue;
+                    }
+                    _ => {
+                        error!("Could not get region #{i} info {e}");
+                        continue;
+                    }
+                }
+            }
+
+            let mut region = VfioRegion {
+                flags: reg_info.flags,
+                size: reg_info.size,
+                offset: reg_info.offset,
+                caps: Vec::new(),
+            };
+            if let Err(e) = self.get_region_map(&mut region, &reg_info) {
+                error!("Could not get region #{i} map {e}");
+                continue;
+            }
+
+            debug!("Region #{i}");
+            debug!("\tflag 0x{:x}", region.flags);
+            debug!("\tsize 0x{:x}", region.size);
+            debug!("\toffset 0x{:x}", region.offset);
+            regions.push(region);
+        }
+
+        Ok(regions)
+    }
+}
+
+impl AsRawFd for VfioDeviceInfo {
+    fn as_raw_fd(&self) -> RawFd {
+        self.device.as_raw_fd()
+    }
+}
+
+/// A safe wrapper over a Vfio device to access underlying hardware device.
+///
+/// The VFIO device API includes ioctls for describing the device, the I/O regions and their
+/// read/write/mmap offsets on the device descriptor, as well as mechanisms for describing and
+/// registering interrupt notifications.
+pub struct VfioDevice {
+    pub(crate) device: ManuallyDrop<File>,
+    pub(crate) flags: u32,
+    pub(crate) regions: Vec<VfioRegion>,
+    pub(crate) irqs: HashMap<u32, VfioIrq>,
+    pub(crate) sysfspath: Option<PathBuf>,
+    /// Hermes: container lookup key of a group opened by node path.
+    pub(crate) group_key: Option<u32>,
+    pub(crate) vfio_ops: Arc<dyn VfioOps>,
+    pub(crate) migration_data_fd: Mutex<Option<File>>,
+    pub(crate) dma_logging_started: Mutex<bool>,
+}
+
+/// Remaining migration data reported by the kernel during precopy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrecopyInfo {
+    /// Bytes that must still be transferred to complete the initial state.
+    pub initial_bytes: u64,
+    /// Bytes of dirty state that have accumulated since precopy started.
+    pub dirty_bytes: u64,
+}
+
+/// IOVA range tracked or reported by VFIO DMA logging.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DmaLoggingRange {
+    /// Starting IOVA of the range.
+    pub iova: u64,
+    /// Length of the range in bytes.
+    pub length: u64,
+}
+
+impl VfioDevice {
+    #[cfg(not(test))]
+    fn get_group_id_from_path(sysfspath: &Path) -> Result<u32> {
+        let uuid_path: PathBuf = [sysfspath, Path::new("iommu_group")].iter().collect();
+        let group_path = uuid_path.read_link().map_err(|_| VfioError::InvalidPath)?;
+        let group_osstr = group_path.file_name().ok_or(VfioError::InvalidPath)?;
+        let group_str = group_osstr.to_str().ok_or(VfioError::InvalidPath)?;
+
+        group_str.parse::<u32>().map_err(|_| VfioError::InvalidPath)
+    }
+
+    #[cfg(feature = "vfio_cdev")]
+    fn get_device_cdev_from_path(sysfspath: &Path) -> Result<File> {
+        // For the folder structure of vfio cdev, refer:
+        // https://docs.kernel.org/driver-api/vfio.html#device-cdev-example
+        let vfio_dev_path = sysfspath.join("vfio-dev");
+
+        let file_list: Vec<PathBuf> = vfio_dev_path
+            .read_dir()
+            .map_err(|_| VfioError::InvalidVfioDev)?
+            .filter_map(|entry| Some(entry.ok()?.path()))
+            .collect();
+
+        if file_list.len() == 1 && file_list[0].is_dir() {
+            let cdev_name = file_list[0].file_name().ok_or(VfioError::InvalidVfioDev)?;
+            let device_cdev_path: PathBuf = Path::new("/dev/vfio/devices/").join(cdev_name);
+
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(device_cdev_path)
+                .map_err(VfioError::OpenDeviceCdev)
+        } else {
+            Err(VfioError::InvalidVfioDev)
+        }
+    }
+
+    // Bind a cdev file to an iommufd.
+    // The binding persists until the cdev file is closed: the kernel tracks
+    // the binding on the cdev file and rejects any subsequent attempts
+    // (see `df->access_granted` in drivers/vfio/device_cdev.c).
+    #[cfg(feature = "vfio_cdev")]
+    fn bind_cdev_to_iommufd(device: &File, vfio_iommufd: &VfioIommufd) -> Result<()> {
+        let mut bind = vfio_device_bind_iommufd {
+            argsz: mem::size_of::<vfio_device_bind_iommufd>() as u32,
+            flags: 0,
+            iommufd: vfio_iommufd.iommufd.as_raw_fd(),
+            out_devid: 0,
+        };
+        vfio_syscall::bind_device_iommufd(device, &mut bind)?;
+
+        Ok(())
+    }
+
+    // Attach a cdev to the iommufd's IOAS
+    #[cfg(feature = "vfio_cdev")]
+    fn attach_cdev_to_ioas(device: &File, vfio_iommufd: &VfioIommufd) -> Result<()> {
+        let mut attach_data = vfio_device_attach_iommufd_pt {
+            argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
+            flags: 0,
+            pt_id: vfio_iommufd.ioas_id,
+        };
+        vfio_syscall::attach_device_iommufd_pt(device, &mut attach_data)?;
+
+        Ok(())
+    }
+
+    fn get_device_info(sysfspath: &Path, vfio_ops: Arc<dyn VfioOps>) -> Result<VfioDeviceInfo> {
+        if let Some(vfio_container) = vfio_ops.as_any().downcast_ref::<VfioContainer>() {
+            let group_id = Self::get_group_id_from_path(sysfspath)?;
+            let group = vfio_container.get_group(group_id)?;
+
+            return group.get_device(sysfspath);
+        }
+
+        #[cfg(feature = "vfio_cdev")]
+        if let Some(vfio_iommufd) = vfio_ops.as_any().downcast_ref::<VfioIommufd>() {
+            // Open the vfio cdev file
+            let device = Self::get_device_cdev_from_path(sysfspath)?;
+
+            // Add the vfio cdev file to VFIO-KVM device tracking
+            vfio_iommufd
+                .common
+                .device_set_fd(device.as_raw_fd(), true)?;
+            // Bind the VFIO device to the iommufd file
+            Self::bind_cdev_to_iommufd(&device, vfio_iommufd)?;
+            // Associate the vfio device to the IOAS within the bound iommufd
+            Self::attach_cdev_to_ioas(&device, vfio_iommufd)?;
+
+            let dev_info = VfioDeviceInfo::get_device_info(&device)?;
+            let dev_info = VfioDeviceInfo::new(device, &dev_info);
+
+            return Ok(dev_info);
+        }
+
+        Err(VfioError::DowncastVfioOps)
+    }
+
+    /// Hermes: the container key for the group node at `group_path`, derived
+    /// from its device number so it is stable for as long as the group exists
+    /// and never collides with an IOMMU group number.
+    fn group_key_from_path(group_path: &Path) -> Result<u32> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let metadata = std::fs::metadata(group_path).map_err(|_| VfioError::InvalidPath)?;
+        if !metadata.file_type().is_char_device() {
+            return Err(VfioError::InvalidPath);
+        }
+        let rdev = metadata.rdev();
+        let (major, minor) = (libc::major(rdev), libc::minor(rdev));
+        if minor >= (1 << 20) || major >= (1 << 11) {
+            return Err(VfioError::InvalidPath);
+        }
+        Ok((1 << 31) | (major << 20) | minor)
+    }
+
+    /// Hermes: create a vfio device from an explicit group node and device
+    /// name, without consulting sysfs. This works inside a jail that holds
+    /// only `/dev/vfio/vfio` and the group node, and it serves both PCI
+    /// devices (named by address) and mdevs (named by UUID).
+    ///
+    /// # Parameters
+    /// * `group_path`: the group's character device node.
+    /// * `device_name`: the device name passed to `VFIO_GROUP_GET_DEVICE_FD`.
+    /// * `vfio_ops`: must be a [`VfioContainer`].
+    pub fn new_from_group(
+        group_path: &Path,
+        device_name: &str,
+        vfio_ops: Arc<dyn VfioOps>,
+    ) -> Result<Self> {
+        let container = vfio_ops
+            .as_any()
+            .downcast_ref::<VfioContainer>()
+            .ok_or(VfioError::DowncastVfioOps)?;
+        let group_key = Self::group_key_from_path(group_path)?;
+        let group = container.get_group_at(group_key, Some(group_path))?;
+        let device_info = match group.get_device_by_name(device_name) {
+            Ok(info) => info,
+            Err(e) => {
+                container.put_group(group);
+                return Err(e);
+            }
+        };
+        let regions = device_info.get_regions()?;
+        let irqs = device_info.get_irqs()?;
+
+        Ok(VfioDevice {
+            device: ManuallyDrop::new(device_info.device),
+            flags: device_info.flags,
+            regions,
+            irqs,
+            sysfspath: None,
+            group_key: Some(group_key),
+            vfio_ops,
+            migration_data_fd: Mutex::new(None),
+            dma_logging_started: Mutex::new(false),
+        })
+    }
+
+    /// Create a new vfio device, then guest read/write on this device could be transferred into kernel vfio.
+    ///
+    /// # Parameters
+    /// * `sysfspath`: specify the vfio device path in sys file system.
+    /// * `vfio_ops`: the vfio device wrapper object that the new VFIO device object will bind to.
+    pub fn new(sysfspath: &Path, vfio_ops: Arc<dyn VfioOps>) -> Result<Self> {
+        let device_info = Self::get_device_info(sysfspath, vfio_ops.clone())?;
+        let regions = device_info.get_regions()?;
+        let irqs = device_info.get_irqs()?;
+
+        Ok(VfioDevice {
+            device: ManuallyDrop::new(device_info.device),
+            flags: device_info.flags,
+            regions,
+            irqs,
+            sysfspath: Some(sysfspath.to_path_buf()),
+            group_key: None,
+            vfio_ops,
+            migration_data_fd: Mutex::new(None),
+            dma_logging_started: Mutex::new(false),
+        })
+    }
+
+    /// Create a new vfio device from an already-opened vfio cdev file.
+    ///
+    /// This lets a caller pass in a pre-opened `/dev/vfio/devices/vfioN` FD
+    /// instead of discovering it through the sysfs path of a PCI device. It
+    /// is only valid when `vfio_ops` is a [`VfioIommufd`]: the legacy
+    /// container/group mode does not expose a per-device cdev, so there is
+    /// no equivalent FD to pass.
+    ///
+    /// # Parameters
+    /// * `device`: an opened vfio cdev file whose ownership is transferred
+    ///   into the returned `VfioDevice`.
+    /// * `vfio_ops`: must be a [`VfioIommufd`].
+    #[cfg(feature = "vfio_cdev")]
+    pub fn new_from_fd(device: File, vfio_ops: Arc<dyn VfioOps>) -> Result<Self> {
+        let vfio_iommufd = vfio_ops
+            .as_any()
+            .downcast_ref::<VfioIommufd>()
+            .ok_or(VfioError::DowncastVfioOps)?;
+
+        // Add the vfio cdev file to VFIO-KVM device tracking
+        vfio_iommufd
+            .common
+            .device_set_fd(device.as_raw_fd(), true)?;
+        // Bind the VFIO device to the iommufd file
+        Self::bind_cdev_to_iommufd(&device, vfio_iommufd)?;
+        // Associate the vfio device to the IOAS within the bound iommufd
+        Self::attach_cdev_to_ioas(&device, vfio_iommufd)?;
+
+        let dev_info = VfioDeviceInfo::get_device_info(&device)?;
+        let device_info = VfioDeviceInfo::new(device, &dev_info);
+        let regions = device_info.get_regions()?;
+        let irqs = device_info.get_irqs()?;
+
+        Ok(VfioDevice {
+            device: ManuallyDrop::new(device_info.device),
+            flags: device_info.flags,
+            regions,
+            irqs,
+            sysfspath: None,
+            group_key: None,
+            vfio_ops,
+            migration_data_fd: Mutex::new(None),
+            dma_logging_started: Mutex::new(false),
+        })
+    }
+
+    /// Construct a `VfioDevice` from a cdev file that is already
+    /// bound to `vfio_ops`'s iommufd.
+    ///
+    /// The cdev's bind state lives on the kernel `vfio_device_file`
+    /// and survives as long as the cdev struct file stays open.
+    /// This entry point skips bind step for use cases where the
+    /// caller already has a cdev file that is bound to the iommufd.
+    ///
+    /// # Parameters
+    /// * `device`: an opened, already-bound vfio cdev file whose
+    ///   ownership is transferred into the returned `VfioDevice`.
+    /// * `vfio_ops`: must be a [`VfioIommufd`] whose iommufd is the
+    ///   same one the cdev was previously bound against.
+    #[cfg(feature = "vfio_cdev")]
+    pub fn new_from_bound_fd(device: File, vfio_ops: Arc<dyn VfioOps>) -> Result<Self> {
+        let vfio_iommufd = vfio_ops
+            .as_any()
+            .downcast_ref::<VfioIommufd>()
+            .ok_or(VfioError::DowncastVfioOps)?;
+
+        // Add the vfio cdev file to VFIO-KVM device tracking
+        vfio_iommufd
+            .common
+            .device_set_fd(device.as_raw_fd(), true)?;
+        // Associate the vfio device to the IOAS within the bound iommufd
+        Self::attach_cdev_to_ioas(&device, vfio_iommufd)?;
+
+        let dev_info = VfioDeviceInfo::get_device_info(&device)?;
+        let device_info = VfioDeviceInfo::new(device, &dev_info);
+        let regions = device_info.get_regions()?;
+        let irqs = device_info.get_irqs()?;
+
+        Ok(VfioDevice {
+            device: ManuallyDrop::new(device_info.device),
+            flags: device_info.flags,
+            regions,
+            irqs,
+            sysfspath: None,
+            group_key: None,
+            vfio_ops,
+            migration_data_fd: Mutex::new(None),
+            dma_logging_started: Mutex::new(false),
+        })
+    }
+
+    /// VFIO device reset only if the device supports being reset.
+    pub fn reset(&self) {
+        if self.flags & VFIO_DEVICE_FLAGS_RESET != 0 {
+            vfio_syscall::reset(self);
+        }
+    }
+
+    /// Get information about VFIO IRQs.
+    ///
+    /// # Arguments
+    /// * `irq_index` - The type (INTX, MSI or MSI-X) of interrupts to enable.
+    pub fn get_irq_info(&self, irq_index: u32) -> Option<&VfioIrq> {
+        self.irqs.get(&irq_index)
+    }
+
+    /// Trigger a VFIO device IRQ from userspace.
+    ///
+    /// Once a signaling mechanism is set, DATA_BOOL or DATA_NONE can be used with ACTION_TRIGGER
+    /// to perform kernel level interrupt loopback testing from userspace (ie. simulate hardware
+    /// triggering).
+    ///
+    /// # Arguments
+    /// * `irq_index` - The type (INTX, MSI or MSI-X) of interrupts to enable.
+    /// * `vector` - The sub-index into the interrupt group of `irq_index`.
+    pub fn trigger_irq(&self, irq_index: u32, vector: u32) -> Result<()> {
+        let irq = self
+            .irqs
+            .get(&irq_index)
+            .ok_or(VfioError::VfioDeviceTriggerIrq)?;
+        if irq.count <= vector {
+            return Err(VfioError::VfioDeviceTriggerIrq);
+        }
+
+        let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(0);
+        irq_set[0].argsz = mem::size_of::<vfio_irq_set>() as u32;
+        irq_set[0].flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER;
+        irq_set[0].index = irq_index;
+        irq_set[0].start = vector;
+        irq_set[0].count = 1;
+
+        vfio_syscall::set_device_irqs(self, irq_set.as_slice())
+            .map_err(|_| VfioError::VfioDeviceTriggerIrq)
+    }
+
+    /// Enables a VFIO device IRQs.
+    /// This maps a vector of EventFds to all VFIO managed interrupts. In other words, this
+    /// tells VFIO which EventFd to write into whenever one of the device interrupt vector
+    /// is triggered.
+    ///
+    /// # Arguments
+    /// * `irq_index` - The type (INTX, MSI or MSI-X) of interrupts to enable.
+    /// * `event_fds` - The EventFds vector that matches all the supported VFIO interrupts.
+    pub fn enable_irq(&self, irq_index: u32, event_fds: Vec<&EventFd>) -> Result<()> {
+        let irq = self
+            .irqs
+            .get(&irq_index)
+            .ok_or(VfioError::VfioDeviceEnableIrq)?;
+        if irq.count == 0 || (irq.count as usize) < event_fds.len() {
+            return Err(VfioError::VfioDeviceEnableIrq);
+        }
+
+        let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(event_fds.len());
+        irq_set[0].argsz = mem::size_of::<vfio_irq_set>() as u32
+            + (event_fds.len() * mem::size_of::<u32>()) as u32;
+        irq_set[0].flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
+        irq_set[0].index = irq_index;
+        irq_set[0].start = 0;
+        irq_set[0].count = event_fds.len() as u32;
+
+        {
+            // irq_set.data could be none, bool or fd according to flags, so irq_set.data
+            // is u8 default, here irq_set.data is a vector of fds as u32, so 4 default u8
+            // are combined together as u32 for each fd.
+            // SAFETY: It is safe as enough space is reserved through
+            // vec_with_array_field(u32)<event_fds.len()>.
+            let fds = unsafe {
+                irq_set[0]
+                    .data
+                    .as_mut_slice(event_fds.len() * mem::size_of::<u32>())
+            };
+            for (index, event_fd) in event_fds.iter().enumerate() {
+                let fds_offset = index * mem::size_of::<u32>();
+                let fd = &mut fds[fds_offset..fds_offset + mem::size_of::<u32>()];
+                NativeEndian::write_u32(fd, event_fd.as_raw_fd() as u32);
+            }
+        }
+
+        vfio_syscall::set_device_irqs(self, irq_set.as_slice())
+            .map_err(|_| VfioError::VfioDeviceEnableIrq)
+    }
+
+    /// Sets a VFIO irq's resample fd.
+    /// This allows to set the signaling for an ACTION_UNMASK action. Once the resample fd
+    /// is set, vfio can auto-unmask the INTX interrupt when the resamplefd is triggered.
+    ///
+    /// # Arguments
+    /// * `irq_index` - INTX (the only type support to set resample fd)
+    /// * `event_rfds` - The resample EventFds will be set to vfio.
+    pub fn set_irq_resample_fd(&self, irq_index: u32, event_rfds: Vec<&EventFd>) -> Result<()> {
+        let irq = self
+            .irqs
+            .get(&irq_index)
+            .ok_or(VfioError::VfioDeviceSetIrqResampleFd)?;
+        // Currently the VFIO driver only support MASK/UNMASK INTX, so count is hard-coded to 1.
+        if irq.count != 1
+            || (irq.count as usize) < event_rfds.len()
+            || irq.index != VFIO_PCI_INTX_IRQ_INDEX
+        {
+            return Err(VfioError::VfioDeviceSetIrqResampleFd);
+        }
+
+        let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(event_rfds.len());
+        irq_set[0].argsz = mem::size_of::<vfio_irq_set>() as u32
+            + (event_rfds.len() * mem::size_of::<u32>()) as u32;
+        irq_set[0].flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_UNMASK;
+        irq_set[0].index = irq_index;
+        irq_set[0].start = 0;
+        irq_set[0].count = event_rfds.len() as u32;
+
+        {
+            // irq_set.data could be none, bool or fd according to flags, so irq_set.data
+            // is u8 default, here irq_set.data is a vector of fds as u32, so 4 default u8
+            // are combined together as u32 for each fd.
+            // SAFETY: It is safe as enough space is reserved through
+            // vec_with_array_field(u32)<event_fds.len()>.
+            let fds = unsafe {
+                irq_set[0]
+                    .data
+                    .as_mut_slice(event_rfds.len() * mem::size_of::<u32>())
+            };
+            for (index, event_fd) in event_rfds.iter().enumerate() {
+                let fds_offset = index * mem::size_of::<u32>();
+                let fd = &mut fds[fds_offset..fds_offset + mem::size_of::<u32>()];
+                NativeEndian::write_u32(fd, event_fd.as_raw_fd() as u32);
+            }
+        }
+
+        vfio_syscall::set_device_irqs(self, irq_set.as_slice())
+            .map_err(|_| VfioError::VfioDeviceSetIrqResampleFd)
+    }
+
+    /// Disables a VFIO device IRQs
+    ///
+    /// # Arguments
+    /// * `irq_index` - The type (INTX, MSI or MSI-X) of interrupts to disable.
+    pub fn disable_irq(&self, irq_index: u32) -> Result<()> {
+        let irq = self
+            .irqs
+            .get(&irq_index)
+            .ok_or(VfioError::VfioDeviceDisableIrq)?;
+        // Currently the VFIO driver only support MASK/UNMASK INTX, so count is hard-coded to 1.
+        if irq.count == 0 {
+            return Err(VfioError::VfioDeviceDisableIrq);
+        }
+
+        // Individual subindex interrupts can be disabled using the -1 value for DATA_EVENTFD or
+        // the index can be disabled as a whole with: flags = (DATA_NONE|ACTION_TRIGGER), count = 0.
+        let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(0);
+        irq_set[0].argsz = mem::size_of::<vfio_irq_set>() as u32;
+        irq_set[0].flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER;
+        irq_set[0].index = irq_index;
+        irq_set[0].start = 0;
+        irq_set[0].count = 0;
+
+        vfio_syscall::set_device_irqs(self, irq_set.as_slice())
+            .map_err(|_| VfioError::VfioDeviceDisableIrq)
+    }
+
+    /// Unmask IRQ
+    ///
+    /// # Arguments
+    /// * `irq_index` - The type (INTX, MSI or MSI-X) of interrupts to unmask.
+    pub fn unmask_irq(&self, irq_index: u32) -> Result<()> {
+        let irq = self
+            .irqs
+            .get(&irq_index)
+            .ok_or(VfioError::VfioDeviceUnmaskIrq)?;
+        // Currently the VFIO driver only support MASK/UNMASK INTX, so count is hard-coded to 1.
+        if irq.count == 0 || irq.count != 1 || irq.index != VFIO_PCI_INTX_IRQ_INDEX {
+            return Err(VfioError::VfioDeviceUnmaskIrq);
+        }
+
+        let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(0);
+        irq_set[0].argsz = mem::size_of::<vfio_irq_set>() as u32;
+        irq_set[0].flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_UNMASK;
+        irq_set[0].index = irq_index;
+        irq_set[0].start = 0;
+        irq_set[0].count = 1;
+
+        vfio_syscall::set_device_irqs(self, irq_set.as_slice())
+            .map_err(|_| VfioError::VfioDeviceUnmaskIrq)
+    }
+
+    /// Wrapper to enable MSI IRQs.
+    pub fn enable_msi(&self, fds: Vec<&EventFd>) -> Result<()> {
+        self.enable_irq(VFIO_PCI_MSI_IRQ_INDEX, fds)
+    }
+
+    /// Wrapper to disable MSI IRQs.
+    pub fn disable_msi(&self) -> Result<()> {
+        self.disable_irq(VFIO_PCI_MSI_IRQ_INDEX)
+    }
+
+    /// Wrapper to enable MSI-X IRQs.
+    pub fn enable_msix(&self, fds: Vec<&EventFd>) -> Result<()> {
+        self.enable_irq(VFIO_PCI_MSIX_IRQ_INDEX, fds)
+    }
+
+    /// Wrapper to disable MSI-X IRQs.
+    pub fn disable_msix(&self) -> Result<()> {
+        self.disable_irq(VFIO_PCI_MSIX_IRQ_INDEX)
+    }
+
+    /// Get a region's flag.
+    ///
+    /// # Arguments
+    /// * `index` - The index of memory region.
+    pub fn get_region_flags(&self, index: u32) -> u32 {
+        match self.regions.get(index as usize) {
+            Some(v) => v.flags,
+            None => 0,
+        }
+    }
+
+    /// Get a region's offset.
+    ///
+    /// # Arguments
+    /// * `index` - The index of memory region.
+    pub fn get_region_offset(&self, index: u32) -> u64 {
+        match self.regions.get(index as usize) {
+            Some(v) => v.offset,
+            None => 0,
+        }
+    }
+
+    /// Get a region's size.
+    ///
+    /// # Arguments
+    /// * `index` - The index of memory region.
+    pub fn get_region_size(&self, index: u32) -> u64 {
+        match self.regions.get(index as usize) {
+            Some(v) => v.size,
+            None => {
+                warn!("get_region_size with invalid index: {index}");
+                0
+            }
+        }
+    }
+
+    /// Get region's list of capabilities
+    ///
+    /// # Arguments
+    /// * `index` - The index of memory region.
+    pub fn get_region_caps(&self, index: u32) -> Vec<VfioRegionInfoCap> {
+        match self.regions.get(index as usize) {
+            Some(v) => v.caps.clone(),
+            None => {
+                warn!("get_region_caps with invalid index: {index}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Read region's data from VFIO device into buf
+    ///
+    /// # Arguments
+    /// * `index`: region num
+    /// * `buf`: data destination and buf length is read size
+    /// * `addr`: offset in the region
+    pub fn region_read(&self, index: u32, buf: &mut [u8], addr: u64) {
+        let region: &VfioRegion = match self.regions.get(index as usize) {
+            Some(v) => v,
+            None => {
+                warn!("region read with invalid index: {index}");
+                return;
+            }
+        };
+
+        let size = buf.len() as u64;
+        if size > region.size || addr + size > region.size {
+            warn!("region read with invalid parameter, add: {addr}, size: {size}");
+            return;
+        }
+
+        if let Err(e) = self.device.read_exact_at(buf, region.offset + addr) {
+            warn!("Failed to read region in index: {index}, addr: {addr}, error: {e}");
+        }
+    }
+
+    /// Write the data from buf into a vfio device region
+    ///
+    /// # Arguments
+    /// * `index`: region num
+    /// * `buf`: data src and buf length is write size
+    /// * `addr`: offset in the region
+    pub fn region_write(&self, index: u32, buf: &[u8], addr: u64) {
+        let stub: &VfioRegion = match self.regions.get(index as usize) {
+            Some(v) => v,
+            None => {
+                warn!("region write with invalid index: {index}");
+                return;
+            }
+        };
+
+        let size = buf.len() as u64;
+        if size > stub.size
+            || addr + size > stub.size
+            || (stub.flags & VFIO_REGION_INFO_FLAG_WRITE) == 0
+        {
+            warn!("region write with invalid parameter, add: {addr}, size: {size}");
+            return;
+        }
+
+        if let Err(e) = self.device.write_all_at(buf, stub.offset + addr) {
+            warn!("Failed to write region in index: {index}, addr: {addr}, error: {e}");
+        }
+    }
+
+    /// Return the maximum numner of interrupts a VFIO device can request.
+    pub fn max_interrupts(&self) -> u32 {
+        let mut max_interrupts = 0;
+        let irq_indexes = vec![
+            VFIO_PCI_INTX_IRQ_INDEX,
+            VFIO_PCI_MSI_IRQ_INDEX,
+            VFIO_PCI_MSIX_IRQ_INDEX,
+        ];
+
+        for index in irq_indexes {
+            if let Some(irq_info) = self.irqs.get(&index) {
+                if irq_info.count > max_interrupts {
+                    max_interrupts = irq_info.count;
+                }
+            }
+        }
+
+        max_interrupts
+    }
+
+    /// Query whether the device supports VFIO migration v2.
+    ///
+    /// Returns `Ok(Some(flags))` with the supported migration capabilities,
+    /// `Ok(None)` when the kernel or device does not support migration v2,
+    /// or `Err` on any other ioctl failure.
+    pub fn query_migration_support(&self) -> Result<Option<u64>> {
+        let mut feature_buf =
+            vec_with_array_field::<vfio_device_feature, vfio_device_feature_migration>(1);
+        feature_buf[0].argsz = (mem::size_of::<vfio_device_feature>()
+            + mem::size_of::<vfio_device_feature_migration>())
+            as u32;
+        feature_buf[0].flags = VFIO_DEVICE_FEATURE_GET | VFIO_DEVICE_FEATURE_MIGRATION;
+        match vfio_syscall::device_feature(self, &mut feature_buf[0]) {
+            Ok(()) => {
+                // SAFETY: vec_with_array_field reserved size_of::<vfio_device_feature_migration>()
+                // bytes immediately after the header, and the kernel populated `flags` on success.
+                let flags = unsafe {
+                    (*(feature_buf[0].data.as_ptr() as *const vfio_device_feature_migration)).flags
+                };
+                Ok(Some(flags))
+            }
+            // ENOTTY means the kernel is too old. EINVAL means the device
+            // does not support the feature.
+            Err(VfioError::VfioDeviceFeature(e))
+                if e.errno() == libc::ENOTTY || e.errno() == libc::EINVAL =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Set the device migration state.
+    ///
+    /// Transitions into a streaming state (PRE_COPY, PRE_COPY_P2P, STOP_COPY,
+    /// RESUMING) from a non-streaming state return a fresh data fd from the
+    /// kernel. The method stores it inside `VfioDevice` for the migration
+    /// data read and write helpers to use. Transitions between two streaming
+    /// states keep the existing fd. Transitions to a non-streaming state
+    /// drop any previously stored fd. On ioctl error the cached fd is also
+    /// dropped, since a partially completed state transition may already have
+    /// closed it on the kernel side.
+    pub fn set_migration_state(&self, state: u32) -> Result<()> {
+        let mut feature_buf =
+            vec_with_array_field::<vfio_device_feature, vfio_device_feature_mig_state>(1);
+        feature_buf[0].argsz = (mem::size_of::<vfio_device_feature>()
+            + mem::size_of::<vfio_device_feature_mig_state>())
+            as u32;
+        feature_buf[0].flags = VFIO_DEVICE_FEATURE_SET | VFIO_DEVICE_FEATURE_MIG_DEVICE_STATE;
+        {
+            // SAFETY: vec_with_array_field reserved size_of::<vfio_device_feature_mig_state>()
+            // bytes immediately after the header.
+            let payload = unsafe {
+                &mut *(feature_buf[0].data.as_mut_ptr() as *mut vfio_device_feature_mig_state)
+            };
+            payload.device_state = state;
+            payload.data_fd = -1;
+        }
+        if let Err(e) = vfio_syscall::device_feature(self, &mut feature_buf[0]) {
+            *self.migration_data_fd.lock().unwrap() = None;
+            return Err(e);
+        }
+        // SAFETY: same buffer as above. The kernel may have written `data_fd`.
+        let data_fd = unsafe {
+            (*(feature_buf[0].data.as_ptr() as *const vfio_device_feature_mig_state)).data_fd
+        };
+        let is_streaming = state == vfio_device_mig_state_VFIO_DEVICE_STATE_PRE_COPY
+            || state == vfio_device_mig_state_VFIO_DEVICE_STATE_PRE_COPY_P2P
+            || state == vfio_device_mig_state_VFIO_DEVICE_STATE_STOP_COPY
+            || state == vfio_device_mig_state_VFIO_DEVICE_STATE_RESUMING;
+        let mut guard = self.migration_data_fd.lock().unwrap();
+        if data_fd >= 0 {
+            // SAFETY: data_fd is a valid file descriptor returned by the kernel.
+            *guard = Some(unsafe { File::from_raw_fd(data_fd) });
+        } else if !is_streaming {
+            *guard = None;
+        }
+        Ok(())
+    }
+
+    /// Get the current device migration state.
+    pub fn get_migration_state(&self) -> Result<u32> {
+        let mut feature_buf =
+            vec_with_array_field::<vfio_device_feature, vfio_device_feature_mig_state>(1);
+        feature_buf[0].argsz = (mem::size_of::<vfio_device_feature>()
+            + mem::size_of::<vfio_device_feature_mig_state>())
+            as u32;
+        feature_buf[0].flags = VFIO_DEVICE_FEATURE_GET | VFIO_DEVICE_FEATURE_MIG_DEVICE_STATE;
+        vfio_syscall::device_feature(self, &mut feature_buf[0])?;
+        // SAFETY: vec_with_array_field reserved the payload bytes after the header.
+        let device_state = unsafe {
+            (*(feature_buf[0].data.as_ptr() as *const vfio_device_feature_mig_state)).device_state
+        };
+        Ok(device_state)
+    }
+
+    /// Query the maximum data size for a single stop-copy transfer.
+    pub fn get_mig_data_size(&self) -> Result<u64> {
+        let mut feature_buf =
+            vec_with_array_field::<vfio_device_feature, vfio_device_feature_mig_data_size>(1);
+        feature_buf[0].argsz = (mem::size_of::<vfio_device_feature>()
+            + mem::size_of::<vfio_device_feature_mig_data_size>())
+            as u32;
+        feature_buf[0].flags = VFIO_DEVICE_FEATURE_GET | VFIO_DEVICE_FEATURE_MIG_DATA_SIZE;
+        vfio_syscall::device_feature(self, &mut feature_buf[0])?;
+        // SAFETY: vec_with_array_field reserved the payload bytes after the header.
+        let stop_copy_length = unsafe {
+            (*(feature_buf[0].data.as_ptr() as *const vfio_device_feature_mig_data_size))
+                .stop_copy_length
+        };
+        Ok(stop_copy_length)
+    }
+
+    /// Query remaining migration data on the stored precopy data fd.
+    pub fn mig_get_precopy_info(&self) -> Result<PrecopyInfo> {
+        let guard = self.migration_data_fd.lock().unwrap();
+        let fd = guard.as_ref().ok_or(VfioError::NoMigrationDataFd)?;
+        let mut info = vfio_precopy_info {
+            argsz: mem::size_of::<vfio_precopy_info>() as u32,
+            ..Default::default()
+        };
+        vfio_syscall::mig_get_precopy_info(fd, &mut info)?;
+        Ok(PrecopyInfo {
+            initial_bytes: info.initial_bytes,
+            dirty_bytes: info.dirty_bytes,
+        })
+    }
+
+    /// Read from the stored migration data fd into `buf`.
+    pub fn read_migration_data(&self, buf: &mut [u8]) -> Result<usize> {
+        let mut guard = self.migration_data_fd.lock().unwrap();
+        let fd = guard.as_mut().ok_or(VfioError::NoMigrationDataFd)?;
+        fd.read(buf).map_err(VfioError::VfioMigrationDataIo)
+    }
+
+    /// Drain the stored migration data fd until EOF.
+    pub fn read_migration_data_to_end(&self) -> Result<Vec<u8>> {
+        // Pre-size to avoid Vec reallocations during read_to_end.
+        let hint = self.get_mig_data_size().unwrap_or(0) as usize;
+        let mut guard = self.migration_data_fd.lock().unwrap();
+        let fd = guard.as_mut().ok_or(VfioError::NoMigrationDataFd)?;
+        let mut data = Vec::with_capacity(hint);
+        fd.read_to_end(&mut data)
+            .map_err(VfioError::VfioMigrationDataIo)?;
+        Ok(data)
+    }
+
+    /// Write the entire `data` slice to the stored migration data fd.
+    pub fn write_migration_data(&self, data: &[u8]) -> Result<()> {
+        let mut guard = self.migration_data_fd.lock().unwrap();
+        let fd = guard.as_mut().ok_or(VfioError::NoMigrationDataFd)?;
+        fd.write_all(data).map_err(VfioError::VfioMigrationDataIo)
+    }
+
+    /// Start DMA dirty page logging for the given IOVA ranges.
+    ///
+    /// `page_size` is the requested granularity in bytes of the dirty
+    /// bitmap. The device may negotiate a different page size. The
+    /// returned value is the granularity the device actually applied and
+    /// is the recommended value to pass to subsequent
+    /// `report_dma_logging` calls. `ranges` is the list of IOVA ranges
+    /// to track.
+    ///
+    /// The kernel allows only one active logging session per device.
+    /// Returns `VfioError::DmaLoggingAlreadyStarted` if logging is
+    /// already active.
+    pub fn start_dma_logging(&self, page_size: u64, ranges: &[DmaLoggingRange]) -> Result<u64> {
+        if ranges.is_empty() {
+            return Err(VfioError::DmaLoggingInvalidArgument(
+                "ranges must not be empty",
+            ));
+        }
+        let num_ranges = u32::try_from(ranges.len())
+            .map_err(|_| VfioError::DmaLoggingInvalidArgument("too many ranges"))?;
+
+        let mut started = self.dma_logging_started.lock().unwrap();
+        if *started {
+            return Err(VfioError::DmaLoggingAlreadyStarted);
+        }
+
+        let kernel_ranges: Vec<vfio_device_feature_dma_logging_range> = ranges
+            .iter()
+            .map(|r| vfio_device_feature_dma_logging_range {
+                iova: r.iova,
+                length: r.length,
+            })
+            .collect();
+        let mut feature_buf =
+            vec_with_array_field::<vfio_device_feature, vfio_device_feature_dma_logging_control>(1);
+        feature_buf[0].argsz = (mem::size_of::<vfio_device_feature>()
+            + mem::size_of::<vfio_device_feature_dma_logging_control>())
+            as u32;
+        feature_buf[0].flags = VFIO_DEVICE_FEATURE_SET | VFIO_DEVICE_FEATURE_DMA_LOGGING_START;
+        {
+            // SAFETY: vec_with_array_field reserved size_of::<vfio_device_feature_dma_logging_control>()
+            // bytes immediately after the header.
+            let payload = unsafe {
+                &mut *(feature_buf[0].data.as_mut_ptr()
+                    as *mut vfio_device_feature_dma_logging_control)
+            };
+            payload.page_size = page_size;
+            payload.num_ranges = num_ranges;
+            payload.__reserved = 0;
+            payload.ranges = kernel_ranges.as_ptr() as u64;
+        }
+        // kernel_ranges must outlive the syscall. It is owned by this stack
+        // frame and dropped after device_feature returns.
+        vfio_syscall::device_feature(self, &mut feature_buf[0])?;
+
+        // The kernel may overwrite page_size with the granularity it
+        // actually picked. Read it back so the caller knows the bitmap
+        // page size to use in subsequent report calls.
+        // SAFETY: the same payload was initialised above and the buffer
+        // outlives this read.
+        let negotiated_page_size = unsafe {
+            (*(feature_buf[0].data.as_ptr() as *const vfio_device_feature_dma_logging_control))
+                .page_size
+        };
+        *started = true;
+        Ok(negotiated_page_size)
+    }
+
+    /// Stop DMA dirty page logging.
+    ///
+    /// Returns `VfioError::DmaLoggingNotStarted` if logging was not
+    /// previously started by `start_dma_logging`.
+    pub fn stop_dma_logging(&self) -> Result<()> {
+        let mut started = self.dma_logging_started.lock().unwrap();
+        if !*started {
+            return Err(VfioError::DmaLoggingNotStarted);
+        }
+        let mut feature_buf = vec_with_array_field::<vfio_device_feature, ()>(1);
+        feature_buf[0].argsz = mem::size_of::<vfio_device_feature>() as u32;
+        feature_buf[0].flags = VFIO_DEVICE_FEATURE_SET | VFIO_DEVICE_FEATURE_DMA_LOGGING_STOP;
+        vfio_syscall::device_feature(self, &mut feature_buf[0])?;
+        *started = false;
+        Ok(())
+    }
+
+    /// Report dirty pages for an IOVA range.
+    ///
+    /// The returned Vec is a packed dirty bitmap, one bit per page.
+    /// Page `i` starts at IOVA `range.iova + i * page_size`. The page
+    /// is dirty when `(bitmap[i / 64] >> (i % 64)) & 1 == 1`. The Vec
+    /// has `ceil(range.length / page_size / 64)` entries.
+    ///
+    /// Passing the value returned by `start_dma_logging` is recommended.
+    /// Smaller values are accepted but force the driver to replicate
+    /// dirty bits and inflate the bitmap.
+    ///
+    /// On error the returned bitmap is corrupt. Recovery is to either
+    /// treat every tracked page as dirty and start a fresh logging
+    /// session via `stop_dma_logging` then `start_dma_logging`, or to
+    /// abort the migration.
+    ///
+    /// Returns `DmaLoggingNotStarted` if logging is not active.
+    pub fn report_dma_logging(&self, range: DmaLoggingRange, page_size: u64) -> Result<Vec<u64>> {
+        if page_size == 0 {
+            return Err(VfioError::DmaLoggingInvalidArgument(
+                "page_size must be non-zero",
+            ));
+        }
+        if range.length == 0 {
+            return Err(VfioError::DmaLoggingInvalidArgument(
+                "range.length must be non-zero",
+            ));
+        }
+        let started = self.dma_logging_started.lock().unwrap();
+        if !*started {
+            return Err(VfioError::DmaLoggingNotStarted);
+        }
+
+        let num_pages = range.length.div_ceil(page_size);
+        let num_u64s = num_pages.div_ceil(u64::BITS as u64) as usize;
+        let mut bitmap = vec![0u64; num_u64s];
+
+        let mut feature_buf =
+            vec_with_array_field::<vfio_device_feature, vfio_device_feature_dma_logging_report>(1);
+        feature_buf[0].argsz = (mem::size_of::<vfio_device_feature>()
+            + mem::size_of::<vfio_device_feature_dma_logging_report>())
+            as u32;
+        feature_buf[0].flags = VFIO_DEVICE_FEATURE_GET | VFIO_DEVICE_FEATURE_DMA_LOGGING_REPORT;
+        {
+            // SAFETY: vec_with_array_field reserved size_of::<vfio_device_feature_dma_logging_report>()
+            // bytes immediately after the header.
+            let payload = unsafe {
+                &mut *(feature_buf[0].data.as_mut_ptr()
+                    as *mut vfio_device_feature_dma_logging_report)
+            };
+            payload.iova = range.iova;
+            payload.length = range.length;
+            payload.page_size = page_size;
+            payload.bitmap = bitmap.as_mut_ptr() as u64;
+        }
+        // bitmap must outlive the syscall. It is owned by this stack frame
+        // and returned to the caller after device_feature returns.
+        vfio_syscall::device_feature(self, &mut feature_buf[0])?;
+        Ok(bitmap)
+    }
+}
+
+impl AsRawFd for VfioDevice {
+    fn as_raw_fd(&self) -> RawFd {
+        self.device.as_raw_fd()
+    }
+}
+
+impl Drop for VfioDevice {
+    fn drop(&mut self) {
+        // ManuallyDrop is needed here because we need to ensure that VfioDevice::device is closed
+        // before dropping VfioDevice::group, otherwise it will cause EBUSY when putting the
+        // group object.
+        if let Some(container) = self.vfio_ops.as_any().downcast_ref::<VfioContainer>() {
+            // SAFETY: we own the File object.
+            unsafe {
+                ManuallyDrop::drop(&mut self.device);
+            }
+
+            // Hermes: a device opened by group node carries its group key, so
+            // teardown never needs sysfs (which is absent inside a jail).
+            let group_id = match (self.group_key, self.sysfspath.as_deref()) {
+                (Some(key), _) => Some(key),
+                (None, Some(sysfspath)) => Self::get_group_id_from_path(sysfspath).ok(),
+                (None, None) => None,
+            };
+            match group_id.map(|id| container.get_group(id)) {
+                Some(Ok(group)) => container.put_group(group),
+                _ => error!("Could not find the VFIO group of a dropped device"),
+            }
+        }
+
+        #[cfg(feature = "vfio_cdev")]
+        if let Some(vfio_iommufd) = self.vfio_ops.as_any().downcast_ref::<VfioIommufd>() {
+            // Remove the association of the vfio device and its current associated IOAS
+            let detach_data = vfio_device_detach_iommufd_pt {
+                argsz: mem::size_of::<vfio_device_detach_iommufd_pt>() as u32,
+                flags: 0,
+            };
+            vfio_syscall::detach_device_iommufd_pt(&self.device, &detach_data).unwrap();
+
+            // Remove the vfio cdev file from VFIO-KVM device tracking
+            vfio_iommufd
+                .common
+                .device_set_fd(self.device.as_raw_fd(), false)
+                .unwrap();
+
+            // SAFETY: we own the File object.
+            unsafe {
+                ManuallyDrop::drop(&mut self.device);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::size_of;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vmm_sys_util::tempfile::TempFile;
+
+    impl VfioGroup {
+        pub(crate) fn open_group_file(id: u32) -> Result<File> {
+            let tmp_file = TempFile::new().unwrap();
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp_file.as_path())
+                .map_err(|e| VfioError::OpenGroup(e, id.to_string()))
+        }
+    }
+
+    impl VfioDevice {
+        pub(crate) fn get_group_id_from_path(_sysfspath: &Path) -> Result<u32> {
+            Ok(3)
+        }
+    }
+
+    #[test]
+    fn test_vfio_region_info_with_cap() {
+        let reg = vfio_region_info {
+            argsz: 129,
+            flags: 0,
+            index: 5,
+            cap_offset: 0,
+            size: 0,
+            offset: 0,
+        };
+        let cap = vfio_region_info_with_cap::from_region_info(&reg);
+
+        assert_eq!(size_of::<vfio_region_info>(), 32);
+        assert_eq!(cap.len(), 5);
+        assert_eq!(cap[0].region_info.argsz, 129);
+        assert_eq!(cap[0].region_info.index, 5);
+
+        let reg = vfio_region_info_with_cap::default();
+        assert_eq!(reg.region_info.index, 0);
+        assert_eq!(reg.region_info.argsz, 0);
+    }
+
+    #[test]
+    fn test_vfio_device_info() {
+        let tmp_file = TempFile::new().unwrap();
+        let device = File::open(tmp_file.as_path()).unwrap();
+        let dev_info = vfio_syscall::create_dev_info_for_test();
+        let device_info = VfioDeviceInfo::new(device, &dev_info);
+
+        let irqs = device_info.get_irqs().unwrap();
+        assert_eq!(irqs.len(), 3);
+        let irq = irqs.get(&0).unwrap();
+        assert_eq!(irq.flags, VFIO_IRQ_INFO_MASKABLE);
+        assert_eq!(irq.count, 1);
+        assert_eq!(irq.index, 0);
+        let irq = irqs.get(&1).unwrap();
+        assert_eq!(irq.flags, VFIO_IRQ_INFO_EVENTFD);
+        assert_eq!(irq.count, 32);
+        assert_eq!(irq.index, 1);
+        let irq = irqs.get(&2).unwrap();
+        assert_eq!(irq.flags, VFIO_IRQ_INFO_EVENTFD);
+        assert_eq!(irq.count, 2048);
+        assert_eq!(irq.index, 2);
+
+        let regions = device_info.get_regions().unwrap();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].flags, 0);
+        assert_eq!(regions[0].offset, 0x10000);
+        assert_eq!(regions[0].size, 0x1000);
+        assert_eq!(regions[0].caps.len(), 0);
+
+        assert_eq!(regions[1].flags, VFIO_REGION_INFO_FLAG_CAPS);
+        assert_eq!(regions[1].offset, 0x20000);
+        assert_eq!(regions[1].size, 0x2000);
+        assert_eq!(regions[1].caps.len(), 3);
+        assert_eq!(regions[1].caps[0], VfioRegionInfoCap::MsixMappable);
+
+        let ty = &regions[1].caps[1];
+        if let VfioRegionInfoCap::Type(t) = ty {
+            assert_eq!(t.type_, 0x5);
+            assert_eq!(t.subtype, 0x6);
+        } else {
+            panic!("expect VfioRegionInfoCapType");
+        }
+
+        let mmap = &regions[1].caps[2];
+        if let VfioRegionInfoCap::SparseMmap(m) = mmap {
+            assert_eq!(m.areas.len(), 1);
+            assert_eq!(m.areas[0].size, 0x3);
+            assert_eq!(m.areas[0].offset, 0x4);
+        } else {
+            panic!("expect VfioRegionInfoCapType");
+        }
+    }
+
+    fn create_vfio_container() -> VfioContainer {
+        let tmp_file = TempFile::new().unwrap();
+        let container = File::open(tmp_file.as_path()).unwrap();
+
+        VfioContainer {
+            container,
+            common: VfioCommon { device_fd: None },
+            groups: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn create_vfio_device() -> VfioDevice {
+        let tmp_file = TempFile::new().unwrap();
+        let path = tmp_file.as_path();
+        let device = File::open(path).unwrap();
+        let dev_info = vfio_syscall::create_dev_info_for_test();
+        let device_info = VfioDeviceInfo::new(device, &dev_info);
+        VfioDevice {
+            device: ManuallyDrop::new(File::open(path).unwrap()),
+            flags: 0,
+            regions: device_info.get_regions().unwrap(),
+            irqs: device_info.get_irqs().unwrap(),
+            sysfspath: Some(path.to_path_buf()),
+            group_key: None,
+            vfio_ops: Arc::new(create_vfio_container()),
+            migration_data_fd: Mutex::new(None),
+            dma_logging_started: Mutex::new(false),
+        }
+    }
+
+    #[test]
+    fn test_query_migration_support() {
+        let device = create_vfio_device();
+        let result = device.query_migration_support().unwrap();
+        assert_eq!(result, Some(VFIO_MIGRATION_STOP_COPY as u64));
+    }
+
+    #[test]
+    fn test_set_migration_state() {
+        let device = create_vfio_device();
+        device
+            .set_migration_state(vfio_device_mig_state_VFIO_DEVICE_STATE_STOP)
+            .unwrap();
+        assert!(device.migration_data_fd.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_set_migration_state_drops_fd_on_error() {
+        let device = create_vfio_device();
+        let tmp_file = TempFile::new().unwrap();
+        *device.migration_data_fd.lock().unwrap() = Some(File::open(tmp_file.as_path()).unwrap());
+
+        // u32::MAX is the test mock's sentinel for the ioctl failure path.
+        assert!(matches!(
+            device.set_migration_state(u32::MAX),
+            Err(VfioError::VfioDeviceFeature(_))
+        ));
+        assert!(device.migration_data_fd.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_set_migration_state_keeps_fd_across_streaming_transitions() {
+        // The test syscall always returns data_fd = -1 (no kernel-allocated fd
+        // in unit tests). Pre-populate the stored fd to simulate what the
+        // kernel would have handed us on a prior PRE_COPY entry, then issue a
+        // streaming-to-streaming transition and check the fd survives.
+        let device = create_vfio_device();
+        let tmp_file = TempFile::new().unwrap();
+        *device.migration_data_fd.lock().unwrap() = Some(File::open(tmp_file.as_path()).unwrap());
+
+        device
+            .set_migration_state(vfio_device_mig_state_VFIO_DEVICE_STATE_STOP_COPY)
+            .unwrap();
+        assert!(device.migration_data_fd.lock().unwrap().is_some());
+
+        device
+            .set_migration_state(vfio_device_mig_state_VFIO_DEVICE_STATE_STOP)
+            .unwrap();
+        assert!(device.migration_data_fd.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_migration_state() {
+        let device = create_vfio_device();
+        let state = device.get_migration_state().unwrap();
+        assert_eq!(state, vfio_device_mig_state_VFIO_DEVICE_STATE_RUNNING);
+    }
+
+    #[test]
+    fn test_get_mig_data_size() {
+        let device = create_vfio_device();
+        let size = device.get_mig_data_size().unwrap();
+        assert_eq!(size, 0x100000);
+    }
+
+    #[test]
+    fn test_mig_get_precopy_info_without_fd() {
+        let device = create_vfio_device();
+        assert!(matches!(
+            device.mig_get_precopy_info(),
+            Err(VfioError::NoMigrationDataFd)
+        ));
+    }
+
+    #[test]
+    fn test_mig_get_precopy_info_with_fd() {
+        let device = create_vfio_device();
+        let tmp_file = TempFile::new().unwrap();
+        *device.migration_data_fd.lock().unwrap() = Some(File::open(tmp_file.as_path()).unwrap());
+        let info = device.mig_get_precopy_info().unwrap();
+        assert_eq!(info, PrecopyInfo::default());
+    }
+
+    #[test]
+    fn test_migration_data_io_without_fd() {
+        let device = create_vfio_device();
+        assert!(matches!(
+            device.read_migration_data_to_end(),
+            Err(VfioError::NoMigrationDataFd)
+        ));
+        assert!(matches!(
+            device.write_migration_data(b""),
+            Err(VfioError::NoMigrationDataFd)
+        ));
+    }
+
+    #[test]
+    fn test_start_dma_logging() {
+        let device = create_vfio_device();
+        let ranges = [DmaLoggingRange {
+            iova: 0x0,
+            length: 0x100000,
+        }];
+        // The mock syscall leaves page_size as supplied, so the returned
+        // granularity should match the input.
+        let negotiated = device.start_dma_logging(0x1000, &ranges).unwrap();
+        assert_eq!(negotiated, 0x1000);
+    }
+
+    #[test]
+    fn test_start_dma_logging_already_started() {
+        let device = create_vfio_device();
+        let ranges = [DmaLoggingRange {
+            iova: 0x0,
+            length: 0x100000,
+        }];
+        device.start_dma_logging(0x1000, &ranges).unwrap();
+        assert!(matches!(
+            device.start_dma_logging(0x1000, &ranges),
+            Err(VfioError::DmaLoggingAlreadyStarted)
+        ));
+    }
+
+    #[test]
+    fn test_start_dma_logging_empty_ranges() {
+        let device = create_vfio_device();
+        assert!(matches!(
+            device.start_dma_logging(0x1000, &[]),
+            Err(VfioError::DmaLoggingInvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn test_stop_dma_logging() {
+        let device = create_vfio_device();
+        let ranges = [DmaLoggingRange {
+            iova: 0x0,
+            length: 0x100000,
+        }];
+        device.start_dma_logging(0x1000, &ranges).unwrap();
+        device.stop_dma_logging().unwrap();
+    }
+
+    #[test]
+    fn test_stop_dma_logging_not_started() {
+        let device = create_vfio_device();
+        assert!(matches!(
+            device.stop_dma_logging(),
+            Err(VfioError::DmaLoggingNotStarted)
+        ));
+    }
+
+    #[test]
+    fn test_report_dma_logging() {
+        let device = create_vfio_device();
+        let ranges = [DmaLoggingRange {
+            iova: 0x0,
+            length: 0x100000,
+        }];
+        device.start_dma_logging(0x1000, &ranges).unwrap();
+        // 0x100000 bytes / 0x1000 page size = 256 pages, 4 u64 entries.
+        let range = DmaLoggingRange {
+            iova: 0x0,
+            length: 0x100000,
+        };
+        let bitmap = device.report_dma_logging(range, 0x1000).unwrap();
+        assert_eq!(bitmap.len(), 4);
+        // The test syscall writes u64::MAX into the first entry to signal
+        // the ioctl path was actually taken.
+        assert_eq!(bitmap[0], u64::MAX);
+    }
+
+    #[test]
+    fn test_report_dma_logging_bitmap_size() {
+        let device = create_vfio_device();
+        let ranges = [DmaLoggingRange {
+            iova: 0x0,
+            length: 0x1000 * 65,
+        }];
+        device.start_dma_logging(0x1000, &ranges).unwrap();
+
+        // Single page must round up to one u64.
+        let range = DmaLoggingRange {
+            iova: 0x0,
+            length: 0x1000,
+        };
+        let bitmap = device.report_dma_logging(range, 0x1000).unwrap();
+        assert_eq!(bitmap.len(), 1);
+
+        // 65 pages must round up to two u64 entries (64-bit aligned).
+        let range = DmaLoggingRange {
+            iova: 0x0,
+            length: 0x1000 * 65,
+        };
+        let bitmap = device.report_dma_logging(range, 0x1000).unwrap();
+        assert_eq!(bitmap.len(), 2);
+    }
+
+    #[test]
+    fn test_report_dma_logging_not_started() {
+        let device = create_vfio_device();
+        let range = DmaLoggingRange {
+            iova: 0x0,
+            length: 0x1000,
+        };
+        assert!(matches!(
+            device.report_dma_logging(range, 0x1000),
+            Err(VfioError::DmaLoggingNotStarted)
+        ));
+    }
+
+    #[test]
+    fn test_report_dma_logging_invalid_args() {
+        let device = create_vfio_device();
+        let ranges = [DmaLoggingRange {
+            iova: 0x0,
+            length: 0x1000,
+        }];
+        device.start_dma_logging(0x1000, &ranges).unwrap();
+
+        let range = DmaLoggingRange {
+            iova: 0x0,
+            length: 0x1000,
+        };
+        assert!(matches!(
+            device.report_dma_logging(range, 0),
+            Err(VfioError::DmaLoggingInvalidArgument(_))
+        ));
+
+        let range = DmaLoggingRange {
+            iova: 0x0,
+            length: 0,
+        };
+        assert!(matches!(
+            device.report_dma_logging(range, 0x1000),
+            Err(VfioError::DmaLoggingInvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn test_dma_logging_ordering() {
+        let device = create_vfio_device();
+        let ranges = [DmaLoggingRange {
+            iova: 0x0,
+            length: 0x100000,
+        }];
+        let range = DmaLoggingRange {
+            iova: 0x0,
+            length: 0x100000,
+        };
+
+        // Logging starts inactive, so stop and report must fail.
+        assert!(matches!(
+            device.stop_dma_logging(),
+            Err(VfioError::DmaLoggingNotStarted)
+        ));
+        assert!(matches!(
+            device.report_dma_logging(range, 0x1000),
+            Err(VfioError::DmaLoggingNotStarted)
+        ));
+
+        // First start succeeds.
+        device.start_dma_logging(0x1000, &ranges).unwrap();
+
+        // Starting again while active is rejected.
+        assert!(matches!(
+            device.start_dma_logging(0x1000, &ranges),
+            Err(VfioError::DmaLoggingAlreadyStarted)
+        ));
+
+        // Report and stop both work in the active state.
+        device.report_dma_logging(range, 0x1000).unwrap();
+        device.stop_dma_logging().unwrap();
+
+        // After stop, state is back to inactive.
+        assert!(matches!(
+            device.stop_dma_logging(),
+            Err(VfioError::DmaLoggingNotStarted)
+        ));
+        assert!(matches!(
+            device.report_dma_logging(range, 0x1000),
+            Err(VfioError::DmaLoggingNotStarted)
+        ));
+
+        // A fresh start is permitted once the previous session has stopped.
+        device.start_dma_logging(0x1000, &ranges).unwrap();
+        device.stop_dma_logging().unwrap();
+    }
+
+    #[test]
+    fn test_vfio_container() {
+        let container = create_vfio_container();
+
+        assert!(container.as_raw_fd() > 0);
+        container.check_api_version().unwrap();
+        container.check_extension(VFIO_TYPE1v2_IOMMU).unwrap();
+
+        let group = VfioGroup::new(1).unwrap();
+        container.device_add_group(&group).unwrap();
+        container.device_del_group(&group).unwrap();
+
+        let group = container.get_group(3).unwrap();
+        assert_eq!(Arc::strong_count(&group), 2);
+        assert_eq!(container.groups.lock().unwrap().len(), 1);
+        let group2 = container.get_group(4).unwrap();
+        assert_eq!(Arc::strong_count(&group2), 2);
+        assert_eq!(container.groups.lock().unwrap().len(), 2);
+
+        let group3 = container.get_group(3).unwrap();
+        assert_eq!(Arc::strong_count(&group), 3);
+        let group4 = container.get_group(3).unwrap();
+        assert_eq!(Arc::strong_count(&group), 4);
+        container.put_group(group4);
+        assert_eq!(Arc::strong_count(&group), 3);
+        container.put_group(group3);
+        assert_eq!(Arc::strong_count(&group), 2);
+        container.put_group(group);
+
+        // SAFETY: this is a test implementation that does not access memory
+        unsafe { container.vfio_dma_map(0x1000, 0x1000, 0x8000 as _) }.unwrap();
+        // SAFETY: this is a test implementation that does not access memory
+        unsafe { container.vfio_dma_map(0x2000, 0x2000, 0x8000 as _) }.unwrap_err();
+        container.vfio_dma_unmap(0x1000, 0x1000).unwrap();
+        container.vfio_dma_unmap(0x2000, 0x2000).unwrap_err();
+    }
+
+    #[test]
+    fn test_vfio_group() {
+        let group = VfioGroup::new(1).unwrap();
+        let tmp_file = TempFile::new().unwrap();
+
+        assert_eq!(group.id, 1);
+        assert!(group.as_raw_fd() >= 0);
+        let device = group.get_device(tmp_file.as_path()).unwrap();
+        assert_eq!(device.num_irqs, 3);
+        assert_eq!(device.num_regions, 9);
+
+        let regions = device.get_regions().unwrap();
+        // test code skips VFIO_PCI_VGA_REGION_INDEX
+        assert_eq!(regions.len(), 8)
+    }
+
+    #[test]
+    fn test_vfio_device() {
+        let tmp_file = TempFile::new().unwrap();
+        let container = Arc::new(create_vfio_container());
+        let device = VfioDevice::new(tmp_file.as_path(), container.clone()).unwrap();
+
+        assert!(device.as_raw_fd() > 0);
+        assert_eq!(device.max_interrupts(), 2048);
+
+        device.reset();
+        assert_eq!(device.regions.len(), 8);
+        assert_eq!(device.irqs.len(), 3);
+
+        assert!(device.get_irq_info(3).is_none());
+        let irq = device.get_irq_info(2).unwrap();
+        assert_eq!(irq.count, 2048);
+
+        device.trigger_irq(3, 0).unwrap_err();
+        device.trigger_irq(2, 2048).unwrap_err();
+        device.trigger_irq(2, 2047).unwrap();
+        device.trigger_irq(2, 0).unwrap();
+
+        device.enable_irq(3, Vec::new()).unwrap_err();
+        device.enable_irq(0, Vec::new()).unwrap_err();
+        device.enable_irq(1, Vec::new()).unwrap();
+
+        device.set_irq_resample_fd(1, Vec::new()).unwrap_err();
+        device.set_irq_resample_fd(0, Vec::new()).unwrap();
+
+        device.disable_irq(3).unwrap_err();
+        device.disable_irq(0).unwrap_err();
+        device.disable_irq(1).unwrap();
+
+        device.unmask_irq(3).unwrap_err();
+        device.unmask_irq(1).unwrap_err();
+        device.unmask_irq(0).unwrap();
+
+        device.enable_msi(Vec::new()).unwrap();
+        device.disable_msi().unwrap();
+        device.enable_msix(Vec::new()).unwrap();
+        device.disable_msix().unwrap();
+
+        assert_eq!(device.get_region_flags(1), VFIO_REGION_INFO_FLAG_CAPS);
+        assert_eq!(device.get_region_flags(7), 0);
+        assert_eq!(device.get_region_flags(8), 0);
+        assert_eq!(device.get_region_offset(1), 0x20000);
+        assert_eq!(device.get_region_offset(7), 0x80000);
+        assert_eq!(device.get_region_offset(8), 0);
+        assert_eq!(device.get_region_size(1), 0x2000);
+        assert_eq!(device.get_region_size(7), 0x8000);
+        assert_eq!(device.get_region_size(8), 0);
+        assert_eq!(device.get_region_caps(1).len(), 3);
+        assert_eq!(device.get_region_caps(7).len(), 0);
+        assert_eq!(device.get_region_caps(8).len(), 0);
+
+        let mut buf = [0u8; 16];
+        device.region_read(8, &mut buf, 0x30000);
+        device.region_read(7, &mut buf, 0x30000);
+        device.region_read(1, &mut buf, 0x30000);
+        device.region_write(8, &buf, 0x30000);
+        device.region_write(7, &buf, 0x30000);
+        device.region_write(1, &buf, 0x30000);
+
+        device.reset();
+
+        drop(device);
+        assert_eq!(container.groups.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn test_vfio_region_info_cap() {
+        let v1 = VfioRegionInfoCap::Type(VfioRegionInfoCapType {
+            type_: 1,
+            subtype: 1,
+        });
+        let v2 = VfioRegionInfoCap::Type(VfioRegionInfoCapType {
+            type_: 1,
+            subtype: 2,
+        });
+
+        assert_eq!(v1, v1.clone());
+        assert_ne!(v1, v2);
+
+        let v3 = VfioRegionInfoCap::SparseMmap(VfioRegionInfoCapSparseMmap {
+            areas: vec![VfioRegionSparseMmapArea { offset: 3, size: 4 }],
+        });
+        let v4 = VfioRegionInfoCap::SparseMmap(VfioRegionInfoCapSparseMmap {
+            areas: vec![VfioRegionSparseMmapArea { offset: 5, size: 6 }],
+        });
+        assert_eq!(v3, v3.clone());
+        assert_ne!(v3, v4);
+        assert_ne!(v1, v4);
+        assert_ne!(v1.clone(), v4);
+
+        let v5 = VfioRegionInfoCap::MsixMappable;
+        assert_eq!(v5, v5.clone());
+        assert_ne!(v5, v1);
+        assert_ne!(v5, v3);
+        assert_ne!(v5, v2.clone());
+        assert_ne!(v5, v4.clone());
+
+        let v6 = VfioRegionInfoCap::Nvlink2Lnkspd(VfioRegionInfoCapNvlink2Lnkspd { link_speed: 7 });
+        let v7 = VfioRegionInfoCap::Nvlink2Lnkspd(VfioRegionInfoCapNvlink2Lnkspd { link_speed: 8 });
+        assert_eq!(v6, v6.clone());
+        assert_ne!(v6, v7);
+        assert_ne!(v6, v1);
+        assert_ne!(v6, v2.clone());
+        assert_ne!(v6, v4.clone());
+
+        let v8 = VfioRegionInfoCap::Nvlink2Ssatgt(VfioRegionInfoCapNvlink2Ssatgt { tgt: 9 });
+        let v9 = VfioRegionInfoCap::Nvlink2Ssatgt(VfioRegionInfoCapNvlink2Ssatgt { tgt: 10 });
+        assert_eq!(v8, v8.clone());
+        assert_ne!(v8, v9);
+        assert_ne!(v8, v1);
+        assert_ne!(v8, v2.clone());
+        assert_ne!(v8, v4.clone());
+        assert_ne!(v8, v6.clone());
+    }
+
+    #[test]
+    fn test_vfio_map_guest_memory() {
+        let addr1 = GuestAddress(0x1000);
+        let mem1 = GuestMemoryMmap::<()>::from_ranges(&[(addr1, 0x1000)]).unwrap();
+        let container = create_vfio_container();
+
+        // SAFETY: This is a dummy implementation that does not access
+        // memory.
+        unsafe { container.vfio_map_guest_memory(&mem1) }.unwrap();
+
+        let addr2 = GuestAddress(0x3000);
+        let mem2 = GuestMemoryMmap::<()>::from_ranges(&[(addr2, 0x1000)]).unwrap();
+
+        container.vfio_unmap_guest_memory(&mem2).unwrap_err();
+
+        let addr3 = GuestAddress(0x1000);
+        let mem3 = GuestMemoryMmap::<()>::from_ranges(&[(addr3, 0x2000)]).unwrap();
+
+        container.vfio_unmap_guest_memory(&mem3).unwrap_err();
+
+        container.vfio_unmap_guest_memory(&mem1).unwrap();
+    }
+
+    #[test]
+    fn test_get_device_type() {
+        let flags: u32 = VFIO_DEVICE_FLAGS_PCI;
+        assert_eq!(flags, VfioDeviceInfo::get_device_type(&flags));
+
+        let flags: u32 = VFIO_DEVICE_FLAGS_PLATFORM;
+        assert_eq!(flags, VfioDeviceInfo::get_device_type(&flags));
+
+        let flags: u32 = VFIO_DEVICE_FLAGS_AMBA;
+        assert_eq!(flags, VfioDeviceInfo::get_device_type(&flags));
+
+        let flags: u32 = VFIO_DEVICE_FLAGS_CCW;
+        assert_eq!(flags, VfioDeviceInfo::get_device_type(&flags));
+
+        let flags: u32 = VFIO_DEVICE_FLAGS_AP;
+        assert_eq!(flags, VfioDeviceInfo::get_device_type(&flags));
+    }
+
+    #[cfg(feature = "vfio_cdev")]
+    #[test]
+    fn test_vfio_device_new_from_fd_rejects_container() {
+        let tmp_file = TempFile::new().unwrap();
+        let device = File::open(tmp_file.as_path()).unwrap();
+        let container: Arc<dyn VfioOps> = Arc::new(create_vfio_container());
+
+        assert!(matches!(
+            VfioDevice::new_from_fd(device, container),
+            Err(VfioError::DowncastVfioOps)
+        ));
+    }
+
+    #[cfg(feature = "vfio_cdev")]
+    #[test]
+    fn test_vfio_device_new_from_bound_fd_rejects_container() {
+        let tmp_file = TempFile::new().unwrap();
+        let device = File::open(tmp_file.as_path()).unwrap();
+        let container: Arc<dyn VfioOps> = Arc::new(create_vfio_container());
+
+        assert!(matches!(
+            VfioDevice::new_from_bound_fd(device, container),
+            Err(VfioError::DowncastVfioOps)
+        ));
+    }
+}

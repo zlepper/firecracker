@@ -1,0 +1,136 @@
+## Upcoming release
+
+## Changed
+
+## Added
+
+## Fixed
+
+# [v0.8.0]
+
+## Changed
+
+- [[163]](https://github.com/rust-vmm/vfio/pull/163) Bump vm-memory dependency to 0.18
+
+# [v0.7.0]
+
+## Changed
+
+- Bump `kvm-ioctls` dependency to 0.25.0
+
+# [v0.6.1]
+
+## Changed
+
+## Added
+- [[148]](https://github.com/rust-vmm/vfio/pull/148) Add `VfioDevice::new_from_fd` to construct a `VfioDevice` from
+  a pre-opened vfio device file (cdev mode only).
+
+- [[140]](https://github.com/rust-vmm/vfio/pull/140) Add VFIO migration v2 ioctl wrappers
+  on `VfioDevice` (`query_migration_support`, `set_migration_state`,
+  `get_migration_state`, `get_mig_data_size`, `mig_get_precopy_info`,
+  `read_migration_data`, `read_migration_data_to_end`, `write_migration_data`).
+  The migration data fd is held internally and not exposed to callers.
+
+- [[150]](https://github.com/rust-vmm/vfio/pull/150) Add VFIO DMA dirty page logging methods on `VfioDevice`
+  (`start_dma_logging`, `stop_dma_logging`, `report_dma_logging`) used by
+  live migration to track guest pages dirtied by device DMA. Adds a
+  public `DmaLoggingRange { iova, length }` struct. `start_dma_logging`
+  returns the granularity the device negotiated, which is recommended for
+  `report_dma_logging`. Logging state is tracked per device so calling
+  `start_dma_logging` twice, or `stop`/`report` without an active
+  session, returns an error instead of issuing the ioctl.
+
+- [[153]](https://github.com/rust-vmm/vfio/pull/153) Add `VfioDevice::new_from_bound_fd` to construct a `VfioDevice`
+   from a pre-opened vfio device file that is already bound to an iommufd (cdev mode only).
+
+## Fixed
+
+# [v0.6.0]
+
+## Changed
+
+- [[137]](https://github.com/rust-vmm/vfio/pull/137) Switch iommufd dependencies from git to crates.io
+
+- [[128]](https://github.com/rust-vmm/vfio/pull/128) Support vm-memory 0.17
+
+- [[103]](https://github.com/rust-vmm/vfio/pull/103)  Functions that map
+  memory into the VFIO device are now marked as `unsafe`.  The caller
+  of these functions is responsible for enforcing various complex but
+  documented invariants to avoid undefined behavior.  This requirement
+  is also present in previous versions of the crate, but the function
+  was not marked unsafe and the invariants were not documented.
+
+  In the future a high-level safe API may be provided that avoids
+  these requirements at the cost of some flexibility.
+
+  Also, size parameters are now `usize` instead of `u64`, and
+  address parameters are `*mut u8` instead of `u64`.
+
+## Added
+- [[106]](https://github.com/rust-vmm/vfio/pull/106) Added new public APIs
+	to support multiple VFIO interfaces: both legacy mode (using
+	containers and groups) and cdev mode (using iommufd)
+
+- [[127]](https://github.com/rust-vmm/vfio/pull/127) vfio-ioctls: Add support for vfio cdev and iommufd
+
+## Fixed
+
+# [v0.5.3]
+
+Yanked due to semver breakage.
+
+# [v0.5.2]
+
+## Changed
+
+- [[114]](https://github.com/rust-vmm/vfio/pull/114)  Cargo.toml: Update deps to latest version
+- [[123]] (https://github.com/rust-vmm/vfio/pull/123) Upgrade mshv-bindings and mshv-ioctls to 0.6.5
+
+## Added
+
+## Fixed
+
+# [v0.5.1]
+
+### Changed
+
+- [[111]](https://github.com/rust-vmm/vfio/pull/111) vfio-ioctls: upgrade mshv-bindings and mshv-ioctls
+
+# [v0.5.0]
+
+## Changed
+
+- [[86]](https://github.com/rust-vmm/vfio/pull/86) Upgrade vmm sys utils to v0.14.0
+- [[87]](https://github.com/rust-vmm/vfio/pull/87) vfio-ioctls: Upgrade kvm-ioctl & kvm-bindings crates
+- [[88]](https://github.com/rust-vmm/vfio/pull/88) Bump thiserror to latest version
+
+# [v0.4.0]
+
+## Added
+
+- Enable support for Microsoft Hyper-V.
+- `VfioError` now propagates the underlying error for more error
+  types.
+- Many structs now derive `Eq` where it makes sense.
+- Added `VfioDevice::set_irq_resample_fd` to unmask level-triggered
+  IRQs via an eventfd.
+
+## Changed
+
+- We skipped to version 0.4.0 to harmonize versions with
+  `vfio-bindings`.
+- The device handle in `VfioContainer::new` has become optional.
+- Device file descriptors have their own type (`VfioDeviceFd`) to hide
+  the underlying hypervisor-specific types.
+- Fixed file descriptor handling on big endian architectures.
+- Avoid logging errors for querying VGA regions for devices that don't
+  have them.
+
+# [v0.1.0]
+
+This is the first `vfio-ioctl` crate release.
+
+This crate provides higher-level abstractions for the
+[Virtual Function I/O (VFIO)](https://www.kernel.org/doc/Documentation/vfio.txt)
+Linux kernel API.

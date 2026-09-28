@@ -1,0 +1,40 @@
+[package]
+name = "vfio-ioctls"
+version = "0.8.0"
+authors = [
+  "The Cloud Hypervisor Authors",
+  "Liu Jiang <gerry@linux.alibaba.com>",
+]
+license = "Apache-2.0 OR BSD-3-Clause"
+description = "Safe wrappers over VFIO ioctls"
+repository = "https://github.com/rust-vmm/vfio"
+readme = "README.md"
+edition = "2018"
+keywords = ["vfio"]
+
+[package.metadata.docs.rs]
+features = ["kvm"]
+
+[features]
+default = ["kvm"]
+kvm = ["kvm-ioctls", "kvm-bindings"]
+mshv = ["mshv-ioctls", "mshv-bindings"]
+vfio_cdev = ["iommufd-bindings", "iommufd-ioctls", "kvm"]
+
+[dependencies]
+byteorder = "1.2.1"
+libc = "0.2.39"
+log = "0.4"
+kvm-bindings = { version = "0.14.0", optional = true }
+kvm-ioctls = { version = "0.25.0", optional = true }
+thiserror = { workspace = true }
+vfio-bindings = { version = "=0.6.2", path = "../vfio-bindings" }
+vm-memory = { version = "0.18", features = ["backend-mmap"] }
+vmm-sys-util = { workspace = true }
+mshv-bindings = { version = "0.6.5", features = [
+  "with-serde",
+  "fam-wrappers",
+], optional = true }
+mshv-ioctls = { version = "0.6.5", optional = true }
+iommufd-bindings = { version = "0.1.0", optional = true }
+iommufd-ioctls = { version = "0.2.0", optional = true }
