@@ -277,6 +277,12 @@ impl PciDevices {
         // Obtain this to avoid needing to lock device mutex below
         let emulated_areas = device.emulated_areas.clone();
 
+        // Route the slot's INTA to the device's legacy GSI in the _PRT.
+        if let Some(gsi) = device.intx_gsi() {
+            self.pci_segment.pci_irq_slots[usize::from(pci_device_bdf.device())] =
+                u8::try_from(gsi).expect("legacy GSIs fit in u8");
+        }
+
         let device = Arc::new(Mutex::new(device));
 
         // This is for config space

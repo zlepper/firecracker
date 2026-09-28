@@ -696,6 +696,57 @@ impl KvmVm {
         Ok(())
     }
 
+    /// Register a level-triggered device IRQ whose line is re-armed through
+    /// `resample_fd` when the guest EOIs it.
+    pub fn register_irq_with_resample(
+        &self,
+        fd: &EventFd,
+        resample_fd: &EventFd,
+        gsi: u32,
+    ) -> Result<(), errno::Error> {
+        self.common
+            .fd
+            .register_irqfd_with_resample(fd, resample_fd, gsi)?;
+
+        let mut entry = kvm_irq_routing_entry {
+            gsi,
+            type_: KVM_IRQ_ROUTING_IRQCHIP,
+            ..Default::default()
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            entry.u.irqchip.irqchip = KVM_IRQCHIP_IOAPIC;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            entry.u.irqchip.irqchip = 0;
+        }
+        entry.u.irqchip.pin = gsi;
+
+        self.common
+            .interrupts
+            .lock()
+            .expect("Poisoned lock")
+            .insert(
+                gsi,
+                RoutingEntry {
+                    entry,
+                    masked: false,
+                },
+            );
+        Ok(())
+    }
+
+    /// Unregister a device IRQ and its route.
+    pub fn unregister_irq(&self, fd: &EventFd, gsi: u32) -> Result<(), errno::Error> {
+        self.common
+            .interrupts
+            .lock()
+            .expect("Poisoned lock")
+            .remove(&gsi);
+        self.common.fd.unregister_irqfd(fd, gsi)
+    }
+
     /// Register an MSI device interrupt
     pub fn register_msi(
         &self,
