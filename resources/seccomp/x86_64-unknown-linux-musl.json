@@ -1223,6 +1223,19 @@
                 "syscall": "exit"
             },
             {
+                "syscall": "fcntl",
+                "comment": "Hermes: a guest write to a trapped VFIO region goes through std's write_all_at, which falls back to F_GETFL after the region fd rejects pwritev2(RWF_NOAPPEND); observed on a T4 passthrough",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "FCNTL_F_GETFL"
+                    }
+                ]
+            },
+            {
                 "syscall": "exit_group"
             },
             {
