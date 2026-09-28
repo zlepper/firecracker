@@ -787,6 +787,14 @@
                 "comment": "Hermes: VFIO device config space and region writes outside vCPU exits"
             },
             {
+                "syscall": "preadv2",
+                "comment": "Hermes: VFIO device region reads (read_exact_at) outside vCPU exits"
+            },
+            {
+                "syscall": "pwritev2",
+                "comment": "Hermes: VFIO device region writes (write_all_at) outside vCPU exits"
+            },
+            {
                 "syscall": "ioctl",
                 "comment": "Needed for opening tap device during net hotplug",
                 "args": [
@@ -1685,6 +1693,14 @@
             {
                 "syscall": "pwrite64",
                 "comment": "Used by VFIO passthrough to write device PCI config and BAR regions on vCPU MMIO/PIO exits"
+            },
+            {
+                "syscall": "preadv2",
+                "comment": "Hermes: read_exact_at on the VFIO device fd lowers to preadv2 on this toolchain"
+            },
+            {
+                "syscall": "pwritev2",
+                "comment": "Hermes: write_all_at on the VFIO device fd lowers to pwritev2 on this toolchain"
             },
             {
                 "syscall": "ioctl",
