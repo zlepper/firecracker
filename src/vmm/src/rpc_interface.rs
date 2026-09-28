@@ -1380,7 +1380,8 @@ mod tests {
         check_unsupported(runtime_request(VmmAction::InsertPassthroughDevice(
             DevicePassthroughConfig {
                 id: String::new(),
-                sbdf: PciSBDF::new(0x0, 0x0, 0x0, 0x0),
+                sbdf: Some(PciSBDF::new(0x0, 0x0, 0x0, 0x0)),
+                ..Default::default()
             },
         )));
     }

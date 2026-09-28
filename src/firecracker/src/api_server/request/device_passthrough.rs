@@ -25,6 +25,11 @@ pub(crate) fn parse_put_device_passthrough(
             METRICS.put_api_requests.device_passthrough_fails.inc();
         })?;
 
+    if let Err(err) = device_cfg.source() {
+        METRICS.put_api_requests.device_passthrough_fails.inc();
+        return Err(RequestError::Generic(StatusCode::BadRequest, err.to_string()));
+    }
+
     if id != device_cfg.id {
         METRICS.put_api_requests.device_passthrough_fails.inc();
         Err(RequestError::Generic(
@@ -76,7 +81,8 @@ mod tests {
 
         let expected_config = DevicePassthroughConfig {
             id: "dev0".to_string(),
-            sbdf: PciSBDF::new(0x0, 0x0, 0x1f, 0x0),
+            sbdf: Some(PciSBDF::new(0x0, 0x0, 0x1f, 0x0)),
+            ..Default::default()
         };
         assert_eq!(r, VmmAction::InsertPassthroughDevice(expected_config));
     }
