@@ -19,7 +19,7 @@ use vmm_sys_util::syscall::SyscallReturnCode;
 use crate::JailerError;
 use crate::cgroup::{CgroupConfiguration, CgroupConfigurationBuilder};
 use crate::chroot::chroot;
-use crate::resource_limits::{FSIZE_ARG, NO_FILE_ARG, ResourceLimits};
+use crate::resource_limits::{FSIZE_ARG, MEMLOCK_ARG, NO_FILE_ARG, ResourceLimits};
 
 pub const PROC_MOUNTS: &str = "/proc/mounts";
 
@@ -341,6 +341,7 @@ impl Env {
             match name {
                 FSIZE_ARG => resource_limits.set_file_size(limit_value),
                 NO_FILE_ARG => resource_limits.set_no_file(limit_value),
+                MEMLOCK_ARG => resource_limits.set_memlock(limit_value),
                 _ => return Err(JailerError::ResLimitArgument(name.to_string())),
             }
         }
@@ -1418,7 +1419,7 @@ mod tests {
         }
 
         // Check valid cases
-        let resources = [FSIZE_ARG, NO_FILE_ARG];
+        let resources = [FSIZE_ARG, NO_FILE_ARG, MEMLOCK_ARG];
         for resource in resources.iter() {
             let arg = vec![resource.to_string() + "=4098"];
             Env::parse_resource_limits(&mut resource_limits, &arg).unwrap();

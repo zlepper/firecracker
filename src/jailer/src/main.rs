@@ -213,7 +213,8 @@ pub fn build_arg_parser() -> ArgParser<'static> {
              add multiple resource limits. Current available resource values are:\n\t\tfsize: The \
              maximum size in bytes for files created by the process.\n\t\tno-file: Specifies a \
              value one greater than the maximum file descriptor number that can be opened by this \
-             process.",
+             process.\n\t\tmemlock: The maximum number of bytes of memory the process may lock, \
+             which VFIO charges DMA-pinned guest memory against.",
         ))
         .arg(
             Argument::new("cgroup-version")

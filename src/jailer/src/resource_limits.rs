@@ -14,6 +14,8 @@ const NO_FILE: u64 = 2048;
 pub(crate) const FSIZE_ARG: &str = "fsize";
 // Number of files resource argument name.
 pub(crate) const NO_FILE_ARG: &str = "no-file";
+// Locked memory resource argument name (Hermes: VFIO pins guest memory).
+pub(crate) const MEMLOCK_ARG: &str = "memlock";
 
 #[derive(Debug, Clone, Copy)]
 pub enum Resource {
@@ -21,6 +23,8 @@ pub enum Resource {
     RlimitFsize,
     // Number of open file descriptors.
     RlimitNoFile,
+    // Bytes of locked memory, which VFIO DMA pinning is charged against.
+    RlimitMemlock,
 }
 
 impl From<Resource> for u32 {
@@ -40,6 +44,9 @@ impl From<Resource> for u32 {
             //      * when equals to "gnu" -> libc::RLIMIT_NOFILE is __rlimit_resource_t which is a
             //        c_uint (which is an u32)
             Resource::RlimitNoFile => libc::RLIMIT_NOFILE as u32,
+            #[allow(clippy::unnecessary_cast)]
+            #[allow(clippy::cast_possible_wrap)]
+            Resource::RlimitMemlock => libc::RLIMIT_MEMLOCK as u32,
         }
     }
 }
@@ -61,6 +68,9 @@ impl From<Resource> for i32 {
             //      * when equals to "gnu" -> libc::RLIMIT_NOFILE is __rlimit_resource_t which is a
             //        c_uint (which is an u32)
             Resource::RlimitNoFile => libc::RLIMIT_NOFILE as i32,
+            #[allow(clippy::unnecessary_cast)]
+            #[allow(clippy::cast_possible_wrap)]
+            Resource::RlimitMemlock => libc::RLIMIT_MEMLOCK as i32,
         }
     }
 }
@@ -70,6 +80,7 @@ impl Display for Resource {
         match self {
             Resource::RlimitFsize => write!(f, "size of file"),
             Resource::RlimitNoFile => write!(f, "number of file descriptors"),
+            Resource::RlimitMemlock => write!(f, "locked memory"),
         }
     }
 }
@@ -78,6 +89,7 @@ impl Display for Resource {
 pub struct ResourceLimits {
     file_size: Option<u64>,
     no_file: u64,
+    memlock: Option<u64>,
 }
 
 impl Default for ResourceLimits {
@@ -85,6 +97,7 @@ impl Default for ResourceLimits {
         ResourceLimits {
             file_size: None,
             no_file: NO_FILE,
+            memlock: None,
         }
     }
 }
@@ -97,6 +110,11 @@ impl ResourceLimits {
         }
         // Set limit on number of file descriptors.
         ResourceLimits::set_limit(Resource::RlimitNoFile, self.no_file)?;
+        if let Some(memlock) = self.memlock {
+            // Set the locked memory limit. It is installed while the jailer is
+            // still root, so it may raise the hard limit.
+            ResourceLimits::set_limit(Resource::RlimitMemlock, memlock)?;
+        }
 
         Ok(())
     }
@@ -120,6 +138,10 @@ impl ResourceLimits {
 
     pub fn set_no_file(&mut self, no_file: u64) {
         self.no_file = no_file;
+    }
+
+    pub fn set_memlock(&mut self, memlock: u64) {
+        self.memlock = Some(memlock);
     }
 }
 
@@ -160,6 +182,10 @@ mod tests {
         assert_eq!(rlimits.file_size.unwrap(), 1);
         rlimits.set_no_file(1);
         assert_eq!(rlimits.no_file, 1);
+        assert!(rlimits.memlock.is_none());
+        rlimits.set_memlock(4096);
+        assert_eq!(rlimits.memlock, Some(4096));
+        assert_eq!(Resource::RlimitMemlock.to_string(), "locked memory");
     }
 
     #[test]
