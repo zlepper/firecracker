@@ -111,6 +111,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
         vsock_override: snapshot_config.vsock_override,
+        vfio_overrides: snapshot_config.vfio_overrides,
         clock_realtime: snapshot_config.clock_realtime,
         huge_pages: snapshot_config.huge_pages,
     };
@@ -151,6 +152,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
             sync_snapshot_files: true,
+            vfio_states: vec![],
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -168,6 +170,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
             sync_snapshot_files: false,
+            vfio_states: vec![],
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -183,6 +186,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
             sync_snapshot_files: true,
+            vfio_states: vec![],
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -213,6 +217,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            vfio_overrides: vec![],
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
         };
@@ -246,6 +251,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            vfio_overrides: vec![],
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
@@ -280,6 +286,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            vfio_overrides: vec![],
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
@@ -322,6 +329,7 @@ mod tests {
                 host_dev_name: String::from("vmtap2"),
             }],
             vsock_override: None,
+            vfio_overrides: vec![],
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
@@ -352,6 +360,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            vfio_overrides: vec![],
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
@@ -479,5 +488,61 @@ mod tests {
             "invalid": "Paused"
         }"#;
         parse_patch_vm_state(&Body::new(invalid_body)).unwrap_err();
+    }
+
+    #[test]
+    fn test_parse_put_snapshot_with_vfio_devices() {
+        use std::path::PathBuf;
+
+        use vmm::vmm_config::snapshot::{VfioOverride, VfioStateTarget};
+
+        let create = r#"{
+            "snapshot_path": "state",
+            "mem_file_path": "memory",
+            "vfio_states": [{ "id": "gpu0", "state_path": "vfio-gpu0.bin" }]
+        }"#;
+        match vmm_action_from_request(
+            parse_put_snapshot(&Body::new(create), Some("create")).unwrap(),
+        ) {
+            VmmAction::CreateSnapshot(params) => assert_eq!(
+                params.vfio_states,
+                vec![VfioStateTarget {
+                    id: "gpu0".to_string(),
+                    state_path: PathBuf::from("vfio-gpu0.bin"),
+                }]
+            ),
+            other => panic!("unexpected action {other:?}"),
+        }
+
+        let load = r#"{
+            "snapshot_path": "state",
+            "mem_backend": { "backend_path": "memory", "backend_type": "File" },
+            "vfio_overrides": [{
+                "id": "gpu0",
+                "group_path": "/dev/vfio/gpu0",
+                "device": "e7a9c3b0-6b0f-4d8e-9a1c-2f4b5d6e7f80",
+                "state_path": "vfio-gpu0.bin"
+            }]
+        }"#;
+        match vmm_action_from_request(parse_put_snapshot(&Body::new(load), Some("load")).unwrap()) {
+            VmmAction::LoadSnapshot(params) => assert_eq!(
+                params.vfio_overrides,
+                vec![VfioOverride {
+                    id: "gpu0".to_string(),
+                    group_path: Some(PathBuf::from("/dev/vfio/gpu0")),
+                    device: Some("e7a9c3b0-6b0f-4d8e-9a1c-2f4b5d6e7f80".to_string()),
+                    state_path: PathBuf::from("vfio-gpu0.bin"),
+                }]
+            ),
+            other => panic!("unexpected action {other:?}"),
+        }
+
+        // A state path is required.
+        let missing = r#"{
+            "snapshot_path": "state",
+            "mem_backend": { "backend_path": "memory", "backend_type": "File" },
+            "vfio_overrides": [{ "id": "gpu0" }]
+        }"#;
+        parse_put_snapshot(&Body::new(missing), Some("load")).unwrap_err();
     }
 }

@@ -1275,6 +1275,7 @@ mod tests {
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
                 sync_snapshot_files: true,
+                vfio_states: vec![],
             },
         )));
         #[cfg(target_arch = "x86_64")]
@@ -1367,6 +1368,7 @@ mod tests {
                 resume_vm: false,
                 network_overrides: vec![],
                 vsock_override: None,
+                vfio_overrides: vec![],
                 clock_realtime: false,
                 huge_pages: SnapshotLoadHugePageConfig::Snapshot,
             },

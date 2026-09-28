@@ -438,6 +438,16 @@ impl From<&GuestMemorySlot<'_>> for kvm_userspace_memory_region {
 }
 
 impl<'a> GuestMemorySlot<'a> {
+    /// The slot as a DMA mapping: IOVA (its guest physical address), size and
+    /// host address.
+    pub(crate) fn dma_range(&self) -> (u64, usize, *mut u8) {
+        (
+            self.guest_addr.raw_value(),
+            self.slice.len(),
+            self.slice.ptr_guard_mut().as_ptr(),
+        )
+    }
+
     /// Dumps the dirty pages in this slot onto the writer
     pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
@@ -703,6 +713,9 @@ impl GuestRegionMmapExt {
         // Commit the bitmap only once the protection and the KVM slot have both changed, rolling
         // back the first step if the second fails. A failed rollback has no way back, so it panics.
         let kvm_region = kvm_userspace_memory_region::from(mem_slot);
+        // Hermes: with a VFIO device attached, a plugged slot must also be
+        // DMA-mapped, and it is unmapped before it leaves KVM.
+        let container = vm.common.vfio_container.get();
         if plug {
             // make it accessible _before_ adding it to KVM
             mem_slot.protect(false)?;
@@ -712,8 +725,24 @@ impl GuestRegionMmapExt {
                     .expect("cannot roll back the virtio-mem slot protection");
                 return Err(err);
             }
+            if let Some(container) = container
+                && let Err(err) = crate::vfio::vfio_dma_map_slot(container, mem_slot)
+            {
+                let mut removed_region = kvm_region;
+                removed_region.memory_size = 0;
+                vm.set_user_memory_region(removed_region)
+                    .expect("cannot roll back the virtio-mem slot in KVM");
+                mem_slot
+                    .protect(true)
+                    .expect("cannot roll back the virtio-mem slot protection");
+                return Err(VmError::VfioDma(Box::new(err)));
+            }
             bitmap_guard.set(idx, true);
         } else {
+            if let Some(container) = container {
+                crate::vfio::vfio_dma_unmap_slot(container, mem_slot)
+                    .map_err(|err| VmError::VfioDma(Box::new(err)))?;
+            }
             // to remove it we need to pass a size of zero
             let mut removed_region = kvm_region;
             removed_region.memory_size = 0;

@@ -219,6 +219,8 @@ pub const HTTP_MAX_PAYLOAD_SIZE: usize = 51200;
 /// have permissions to open the KVM fd).
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum VmmError {
+    /// VFIO device error: {0}
+    Vfio(String),
     #[cfg(target_arch = "aarch64")]
     /// Invalid command line error.
     Cmdline,
@@ -457,10 +459,12 @@ impl Vmm {
             });
         if let Some(pci_devices) = self.device_manager.pci_devices() {
             for device in pci_devices.vfio_devices.iter() {
-                tuples.push((
-                    "passthrough device",
-                    device.lock().unwrap().config.id.clone(),
-                ));
+                let device = device.lock().unwrap();
+                // Hermes: a device whose state was streamed for this snapshot
+                // is snapshottable.
+                if !device.has_saved_state() {
+                    tuples.push(("passthrough device", device.config.id.clone()));
+                }
             }
         }
         if tuples.is_empty() {
@@ -484,6 +488,10 @@ impl Vmm {
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
         self.device_manager.kick_virtio_devices();
+        // Hermes: VFIO devices run again before the vCPUs do.
+        self.device_manager
+            .vfio_unquiesce()
+            .map_err(|err| VmmError::Vfio(err.to_string()))?;
         kvm_vm.resume_vcpus()?;
         self.instance_info.state = VmState::Running;
         Ok(())
@@ -496,6 +504,11 @@ impl Vmm {
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
         kvm_vm.pause_vcpus()?;
+        // Hermes: stop VFIO devices once no vCPU can touch them, so they do no
+        // DMA while paused and a snapshot sees them stopped.
+        self.device_manager
+            .vfio_quiesce()
+            .map_err(|err| VmmError::Vfio(err.to_string()))?;
         self.instance_info.state = VmState::Paused;
         Ok(())
     }

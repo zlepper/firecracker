@@ -155,6 +155,9 @@ pub struct VmResources {
     pub serial_rate_limiter_cfg: Option<TokenBucketConfig>,
     /// Device passthrough configuration.
     pub device_passthrough: DevicePassthroughConfigs,
+    /// Hermes: device state files of the VFIO devices of a snapshot being
+    /// loaded, by device id. Transient; never part of the VM configuration.
+    pub vfio_state_paths: std::collections::HashMap<String, PathBuf>,
 }
 
 impl VmResources {
@@ -280,10 +283,10 @@ impl VmResources {
     }
 
     /// Check if current config is compatible with adding a memory hotplug device
+    ///
+    /// Hermes: virtio-mem works with passthrough devices; plugged slots are
+    /// DMA-mapped for them.
     pub fn compatible_with_memory_hotplug(&self) -> Result<(), ResourcesError> {
-        if !self.device_passthrough.configs.is_empty() {
-            return Err(ResourcesError::DevicePassthroughWithMemHotplug);
-        }
         Ok(())
     }
 
@@ -299,9 +302,6 @@ impl VmResources {
     pub fn compatible_with_passthrough_device(&self) -> Result<(), ResourcesError> {
         if !self.pci_enabled {
             return Err(ResourcesError::DevicePassthroughWithoutPci);
-        }
-        if self.memory_hotplug.is_some() {
-            return Err(ResourcesError::DevicePassthroughWithMemHotplug);
         }
         if self.balloon.get().is_some() {
             return Err(ResourcesError::DevicePassthroughWithBalloon);
@@ -749,6 +749,7 @@ mod tests {
             serial_rate_limiter_cfg: None,
             memory_hotplug: Default::default(),
             device_passthrough: Default::default(),
+            vfio_state_paths: Default::default(),
         }
     }
 

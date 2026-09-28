@@ -318,6 +318,60 @@ impl DeviceManager {
         Ok(())
     }
 
+    /// Hermes: quiesce every VFIO device for a VM pause, in two phases.
+    pub fn vfio_quiesce(&self) -> Result<(), crate::vfio::VfioError> {
+        if let VirtioDevices::Pci(devices) = &self.virtio_devices {
+            for p2p_only in [true, false] {
+                for device in &devices.vfio_devices {
+                    device.lock().expect("Poisoned lock").quiesce(p2p_only)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Hermes: let every VFIO device run again for a VM resume, in two phases.
+    pub fn vfio_unquiesce(&self) -> Result<(), crate::vfio::VfioError> {
+        if let VirtioDevices::Pci(devices) = &self.virtio_devices {
+            for p2p_only in [true, false] {
+                for device in &devices.vfio_devices {
+                    device.lock().expect("Poisoned lock").unquiesce(p2p_only)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Hermes: stream each VFIO device's state into its snapshot file.
+    pub fn save_vfio_device_states(
+        &self,
+        targets: &[crate::vmm_config::snapshot::VfioStateTarget],
+        sync: bool,
+    ) -> Result<(), crate::vfio::VfioError> {
+        if let VirtioDevices::Pci(devices) = &self.virtio_devices {
+            for device in &devices.vfio_devices {
+                let mut device = device.lock().expect("Poisoned lock");
+                let target = targets
+                    .iter()
+                    .find(|target| target.id == device.config.id)
+                    .ok_or_else(|| {
+                        crate::vfio::VfioError::MissingStatePath(device.config.id.clone())
+                    })?;
+                device.save_device_state(&target.state_path, sync)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Hermes: forget streamed VFIO state once a snapshot attempt ends.
+    pub fn clear_vfio_saved_states(&self) {
+        if let VirtioDevices::Pci(devices) = &self.virtio_devices {
+            for device in &devices.vfio_devices {
+                device.lock().expect("Poisoned lock").clear_saved_state();
+            }
+        }
+    }
+
     pub fn attach_vfio_device(
         &mut self,
         vm: &Arc<KvmVm>,

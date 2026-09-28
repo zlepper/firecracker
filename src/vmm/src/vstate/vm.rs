@@ -60,6 +60,30 @@ pub struct RoutingEntry {
     masked: bool,
 }
 
+/// Hermes: the VFIO container of a VM, set once the first device attaches.
+#[derive(Default)]
+pub struct VfioContainerCell(std::sync::OnceLock<Arc<crate::vfio::VfioContainer>>);
+
+impl std::fmt::Debug for VfioContainerCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VfioContainerCell")
+            .field("set", &self.0.get().is_some())
+            .finish()
+    }
+}
+
+impl VfioContainerCell {
+    /// The container, if a VFIO device is attached.
+    pub fn get(&self) -> Option<&Arc<crate::vfio::VfioContainer>> {
+        self.0.get()
+    }
+
+    /// Record the container; later calls keep the first one.
+    pub fn set(&self, container: Arc<crate::vfio::VfioContainer>) {
+        let _ = self.0.set(container);
+    }
+}
+
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
 pub struct VmCommon {
@@ -83,6 +107,9 @@ pub struct VmCommon {
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
+    /// Hermes: the VFIO container of attached devices, so memory hotplug can
+    /// DMA-map the slots it plugs.
+    pub vfio_container: VfioContainerCell,
     /// Test-only countdown that forces the Nth-next `set_user_memory_region` call to fail, used
     /// to exercise partial-failure handling. 0 means never fail.
     #[cfg(test)]
@@ -116,6 +143,8 @@ pub enum VmError {
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
     MemoryError(#[from] MemoryError),
+    /// VFIO DMA mapping of a memory slot failed: {0}
+    VfioDma(Box<crate::vfio::VfioError>),
 }
 
 /// VM abstraction: either a KVM-based VM or (in the future) a Nitro Enclave.
@@ -195,6 +224,7 @@ impl KvmVm {
             uffd: None,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
+            vfio_container: VfioContainerCell::default(),
             #[cfg(test)]
             fail_set_user_memory_region_in: AtomicU32::new(0),
         })

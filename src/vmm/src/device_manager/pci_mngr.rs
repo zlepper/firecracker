@@ -38,8 +38,9 @@ use crate::pci::bus::PciRootError;
 use crate::resources::VmResources;
 use crate::snapshot::Persist;
 use crate::vfio::{
-    VfioContainer, VfioDevice, VfioError, vfio_create_kvm_vfio_device_and_vfio_container,
-    vfio_dma_map_guest_memory,
+    VfioContainer, VfioDevice, VfioDeviceState, VfioError,
+    vfio_create_kvm_vfio_device_and_vfio_container, vfio_dma_map_guest_memory, vfio_finish_restore,
+    vfio_restore_device,
 };
 use crate::vmm_config::device_passthrough::DevicePassthroughConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -270,6 +271,8 @@ impl PciDevices {
             let container = vfio_create_kvm_vfio_device_and_vfio_container(vm.as_ref())?;
             let device = VfioDevice::new(&container, vm, config, pci_device_bdf)?;
             vfio_dma_map_guest_memory(&container, vm.guest_memory())?;
+            // Memory hotplug DMA-maps the slots it plugs from now on.
+            vm.common.vfio_container.set(container.clone());
             self.vfio_container = Some(container);
             device
         };
@@ -304,6 +307,56 @@ impl PciDevices {
 
         self.vfio_devices.push(device);
 
+        Ok(())
+    }
+
+    /// Hermes: restore snapshotted VFIO devices. The container maps guest
+    /// memory (including plugged virtio-mem slots) as soon as the first group
+    /// is attached, before any device leaves RESUMING.
+    fn restore_vfio_devices(
+        &mut self,
+        vm: &Arc<KvmVm>,
+        vm_resources: &mut VmResources,
+        states: &[VfioDeviceState],
+    ) -> Result<(), PciManagerError> {
+        if states.is_empty() {
+            return Ok(());
+        }
+        let container = vfio_create_kvm_vfio_device_and_vfio_container(vm.as_ref())?;
+        for (index, state) in states.iter().enumerate() {
+            let state_path = vm_resources
+                .vfio_state_paths
+                .get(&state.id)
+                .ok_or_else(|| VfioError::MissingStatePath(state.id.clone()))?
+                .clone();
+            let device = vfio_restore_device(&container, vm, state, &state_path)?;
+            if index == 0 {
+                vfio_dma_map_guest_memory(&container, vm.guest_memory())?;
+                vm.common.vfio_container.set(container.clone());
+            }
+            if let Some(gsi) = device.intx_gsi() {
+                self.pci_segment.pci_irq_slots[usize::from(state.sbdf.device())] =
+                    u8::try_from(gsi).expect("legacy GSIs fit in u8");
+            }
+            let emulated_areas = device.emulated_areas.clone();
+            let device = Arc::new(Mutex::new(device));
+            self.pci_segment
+                .pci_bus
+                .lock()
+                .expect("Poisoned lock")
+                .add_device(state.sbdf.device(), device.clone())?;
+            for area in emulated_areas {
+                vm.common
+                    .mmio_bus
+                    .insert(device.clone(), area.gpa, area.size)?;
+            }
+            vm_resources
+                .device_passthrough
+                .configs
+                .push(state.passthrough_config());
+            self.vfio_devices.push(device);
+        }
+        self.vfio_container = Some(container);
         Ok(())
     }
 
@@ -409,6 +462,8 @@ pub struct PciDevicesState {
     pub pmem_devices: Vec<VirtioDeviceState<PmemState>>,
     /// Memory device state.
     pub memory_device: Option<VirtioDeviceState<VirtioMemState>>,
+    /// Hermes: VFIO device states.
+    pub vfio_devices: Vec<VfioDeviceState>,
 }
 
 pub struct PciDevicesConstructorArgs<'a> {
@@ -571,6 +626,12 @@ impl<'a> Persist<'a> for PciDevices {
                 }
             }
         }
+
+        state.vfio_devices = self
+            .vfio_devices
+            .iter()
+            .map(|device| device.lock().expect("Poisoned lock").state())
+            .collect();
 
         state
     }
@@ -761,11 +822,19 @@ impl<'a> Persist<'a> for PciDevices {
             )?
         }
 
+        // Hermes: VFIO devices load their state onto the destination devices
+        // named by the snapshot's overrides.
+        pci_devices.restore_vfio_devices(
+            constructor_args.vm,
+            constructor_args.vm_resources,
+            &state.vfio_devices,
+        )?;
+
         // After PCI devices are restored, we must set up the GSI routes (one KVM_SET_GSI_ROUTING call for all vectors),
         // and enable all unmasked vectors (one kvm_irqfd call per vector).
         // Ordering: routing must be set before IRQFDs to avoid kernel panics on
         // older AMD/SVM hosts (see kernel commit a80ced6ea514).
-        if !pci_devices.virtio_devices.is_empty() {
+        if !pci_devices.virtio_devices.is_empty() || !pci_devices.vfio_devices.is_empty() {
             constructor_args
                 .vm
                 .set_gsi_routes()
@@ -775,6 +844,10 @@ impl<'a> Persist<'a> for PciDevices {
                 let dev = pci_device.lock().expect("Poisoned lock");
                 dev.enable_unmasked_vectors()
                     .map_err(PciManagerError::from)?;
+            }
+            for (device, saved) in pci_devices.vfio_devices.iter().zip(&state.vfio_devices) {
+                let mut device = device.lock().expect("Poisoned lock");
+                vfio_finish_restore(&mut device, saved.irq_mode).map_err(PciManagerError::from)?;
             }
         }
 

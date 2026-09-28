@@ -163,7 +163,9 @@ pub enum CreateSnapshotError {
 }
 
 /// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
+///
+/// Hermes: 12.1 adds VFIO device state to the PCI device states.
+pub const SNAPSHOT_VERSION: Version = Version::new(12, 1, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -171,9 +173,21 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    let microvm_state = vmm
-        .save_state(vm_info)
-        .map_err(CreateSnapshotError::MicrovmState)?;
+    // Hermes: stream every VFIO device's state first. The VM is paused, so
+    // the devices are stopped; a device without a state file, or one that
+    // cannot migrate, makes the snapshot fail.
+    let streamed = vmm
+        .device_manager
+        .save_vfio_device_states(&params.vfio_states, params.sync_snapshot_files)
+        .map_err(|err| {
+            CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(err.to_string()))
+        });
+    let microvm_state = streamed.and_then(|()| {
+        vmm.save_state(vm_info)
+            .map_err(CreateSnapshotError::MicrovmState)
+    });
+    vmm.device_manager.clear_vfio_saved_states();
+    let microvm_state = microvm_state?;
 
     snapshot_state_to_file(
         &microvm_state,
@@ -403,6 +417,30 @@ pub fn restore_from_snapshot(
             .ok_or(SnapshotStateFromFileError::UnknownNetworkDevice)?;
     }
 
+    // Hermes: point each VFIO device at its destination device and state file.
+    vm_resources.vfio_state_paths.clear();
+    if let VirtioDevicesState::Pci(pci_state) = &mut microvm_state.device_states.virtio_state {
+        for entry in &params.vfio_overrides {
+            let device = pci_state
+                .vfio_devices
+                .iter_mut()
+                .find(|device| device.id == entry.id)
+                .ok_or(SnapshotStateFromFileError::UnknownVfioDevice)?;
+            if let Some(group_path) = &entry.group_path {
+                device.group_path = Some(group_path.clone());
+                device.host_sbdf = None;
+            }
+            if let Some(name) = &entry.device {
+                device.device = Some(name.clone());
+            }
+            vm_resources
+                .vfio_state_paths
+                .insert(entry.id.clone(), entry.state_path.clone());
+        }
+    } else if !params.vfio_overrides.is_empty() {
+        return Err(SnapshotStateFromFileError::UnknownVfioDevice.into());
+    }
+
     if let Some(vsock_override) = &params.vsock_override {
         // There should only ever be at most one vsock device, therefore this
         // should correctly find it and modify the path if such a device exists.
@@ -503,6 +541,8 @@ pub enum SnapshotStateFromFileError {
     UnknownNetworkDevice,
     /// Unknown Vsock Device.
     UnknownVsockDevice,
+    /// Unknown VFIO device.
+    UnknownVfioDevice,
 }
 
 fn snapshot_state_from_file(

@@ -251,6 +251,7 @@ fn verify_create_snapshot(
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_file_path: memory_file.as_path().to_path_buf(),
         sync_snapshot_files: true,
+        vfio_states: vec![],
     };
 
     controller
@@ -317,6 +318,7 @@ fn verify_load_snapshot(
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            vfio_overrides: vec![],
             clock_realtime: false,
             huge_pages,
         }))
@@ -389,6 +391,7 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            vfio_overrides: vec![],
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
         }))
@@ -462,6 +465,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         resume_vm: false,
         network_overrides: vec![],
         vsock_override: None,
+        vfio_overrides: vec![],
         clock_realtime: false,
         huge_pages: SnapshotLoadHugePageConfig::Snapshot,
     });

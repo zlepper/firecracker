@@ -535,7 +535,11 @@ impl VirtioMem {
         self.config.plugged_size -= usize_to_u64(self.nb_blocks_to_len(plugged_before));
         self.config.plugged_size += usize_to_u64(self.nb_blocks_to_len(plugged_after));
 
-        if !plug {
+        // Hermes: a slot that stays plugged is still DMA-mapped (and pinned)
+        // for a VFIO device. Discarding its unplugged blocks would make the
+        // device and the CPU see different pages, so keep them.
+        let pinned = keep_plugged && self.vm.common.vfio_container.get().is_some();
+        if !plug && !pinned {
             let addr =
                 GuestAddress(self.config.addr + touched.start as u64 * self.config.block_size);
             if let Err(err) = self

@@ -278,6 +278,7 @@ mod tests {
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
                 sync_snapshot_files: true,
+                vfio_states: vec![],
             })),
             start_time_us,
         );
@@ -292,6 +293,7 @@ mod tests {
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
                 sync_snapshot_files: true,
+                vfio_states: vec![],
             })),
             start_time_us,
         );

@@ -39,8 +39,15 @@ use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vm::{KvmVm, VmError};
 
 mod interrupts;
+mod migration;
+mod persist;
 use interrupts::{VfioIntx, VfioMsi, set_irq_mode};
 pub use interrupts::{VfioIntxState, VfioIrqMode, VfioMsiState};
+pub use migration::VfioMigrationSupport;
+pub use persist::{
+    VfioDeviceFingerprint, VfioDeviceState, VfioMsixSavedState, vfio_finish_restore,
+    vfio_restore_device,
+};
 
 // Number of 4 byte registers in the config space
 const PCI_CONFIG_SPACE_REGS: u16 = 1024;
@@ -86,6 +93,18 @@ pub enum VfioError {
     Irqfd(vmm_sys_util::errno::Error),
     /// Failed to allocate a legacy GSI: {0}
     LegacyGsi(vm_allocator::Error),
+    /// VFIO migration transition to {0} failed: {1}
+    MigrationTransition(&'static str, vfio_ioctls::VfioError),
+    /// Device {0} does not support stop-and-copy migration
+    MigrationUnsupported(String),
+    /// Device state file error: {0}
+    StateFile(std::io::Error),
+    /// Device state file has {1} bytes, expected {0}
+    StateSizeMismatch(u64, u64),
+    /// Device {0} does not match the snapshotted device model
+    FingerprintMismatch(String),
+    /// No device state file was given for VFIO device {0}
+    MissingStatePath(String),
     /// KVM failed to create KVM_DEV_TYPE_VFIO device: {0}
     KvmCreateVfioDevice(kvm_ioctls::Error),
     /// BAR{0} MSI-X table at offset {1:#x} size {2:#x} does not fit in region of size {3:#x}
@@ -197,6 +216,12 @@ pub struct VfioDevice {
     masks: Vec<VfioRegisterMask>,
     /// Size of the device's config region; accesses past it are ignored.
     config_size: u64,
+    /// Migration capabilities.
+    migration: VfioMigrationSupport,
+    /// Device model identity, checked on restore.
+    fingerprint: VfioDeviceFingerprint,
+    /// Size of the state streamed for the snapshot being taken.
+    saved_state_size: Option<u64>,
     vm: Arc<KvmVm>,
 }
 
@@ -1310,14 +1335,11 @@ fn vfio_unmap_bar_mapping(vm: &KvmVm, mapping: &VfioBarMapping) {
     }
 }
 
-/// This will open a VFIO device, attach its group both to the KVM VFIO device and to the VFIO
-/// container. It will setup MSIx irqs and BAR DMAs.
-fn vfio_init_device(
+/// Open the device named by `config` through `container`.
+fn vfio_open_device(
     container: &Arc<VfioContainer>,
-    vm: &Arc<KvmVm>,
-    config: DevicePassthroughConfig,
-    sbdf: PciSBDF,
-) -> Result<VfioDevice, VfioError> {
+    config: &DevicePassthroughConfig,
+) -> Result<InternalVfioDevice, VfioError> {
     let ops = container.clone() as Arc<dyn vfio_ioctls::VfioOps>;
     let device = match config.source().map_err(VfioError::Config)? {
         DevicePassthroughSource::Sysfs(sbdf) => {
@@ -1336,6 +1358,37 @@ fn vfio_init_device(
             InternalVfioDevice::new_from_group(group_path, device, ops)?
         }
     };
+    Ok(device)
+}
+
+/// Region info of BAR `index`, including its raw config space value.
+fn vfio_region_info(device: &InternalVfioDevice, index: usize) -> VfioRegionInfo {
+    let bar_offset = u64::from(PCI_CONFIG_BAR_OFFSET) + usize_to_u64(index) * 4;
+    let mut value: u32 = 0;
+    device.region_read(
+        VFIO_PCI_CONFIG_REGION_INDEX,
+        value.as_mut_bytes(),
+        bar_offset,
+    );
+    #[allow(clippy::cast_possible_truncation)]
+    VfioRegionInfo {
+        value,
+        flags: device.get_region_flags(index as u32),
+        size: device.get_region_size(index as u32),
+        offset: device.get_region_offset(index as u32),
+        caps: device.get_region_caps(index as u32),
+    }
+}
+
+/// This will open a VFIO device, attach its group both to the KVM VFIO device and to the VFIO
+/// container. It will setup MSIx irqs and BAR DMAs.
+fn vfio_init_device(
+    container: &Arc<VfioContainer>,
+    vm: &Arc<KvmVm>,
+    config: DevicePassthroughConfig,
+    sbdf: PciSBDF,
+) -> Result<VfioDevice, VfioError> {
+    let device = vfio_open_device(container, &config)?;
     device.reset();
 
     // mdev config regions are often only the 256 byte legacy space. A read
@@ -1343,6 +1396,12 @@ fn vfio_init_device(
     let config_size = device
         .get_region_size(VFIO_PCI_CONFIG_REGION_INDEX)
         .min(u64::from(PCI_CONFIG_SPACE_REGS) * 4);
+
+    let migration_support = VfioMigrationSupport::query(&device)?;
+    if config.require_migration && !migration_support.stop_copy() {
+        return Err(VfioError::MigrationUnsupported(config.id.clone()));
+    }
+    let fingerprint = VfioDeviceFingerprint::of(&device, config_size);
 
     let mut config_space = [0_u32; PCI_CONFIG_SPACE_REGS as usize];
     device.region_read(
@@ -1400,23 +1459,8 @@ fn vfio_init_device(
     }
 
     // There is no direct access to `regions` in `VfioDevice`, so need to work around this
-    let bar_region_infos: [VfioRegionInfo; NUM_BAR_REGS as usize] = std::array::from_fn(|i| {
-        let bar_offset = u64::from(PCI_CONFIG_BAR_OFFSET) + usize_to_u64(i) * 4;
-        let mut value: u32 = 0;
-        device.region_read(
-            VFIO_PCI_CONFIG_REGION_INDEX,
-            value.as_mut_bytes(),
-            bar_offset,
-        );
-        #[allow(clippy::cast_possible_truncation)]
-        VfioRegionInfo {
-            value,
-            flags: device.get_region_flags(i as u32),
-            size: device.get_region_size(i as u32),
-            offset: device.get_region_offset(i as u32),
-            caps: device.get_region_caps(i as u32),
-        }
-    });
+    let bar_region_infos: [VfioRegionInfo; NUM_BAR_REGS as usize] =
+        std::array::from_fn(|i| vfio_region_info(&device, i));
 
     let bars = VfioBars::new(vm.clone(), &bar_region_infos)?;
 
@@ -1457,6 +1501,9 @@ fn vfio_init_device(
         irq_mode: VfioIrqMode::None,
         masks,
         config_size,
+        migration: migration_support,
+        fingerprint,
+        saved_state_size: None,
         vm: vm.clone(),
     };
     // A freshly reset device starts in INTx mode, if it has INTx.
@@ -1482,6 +1529,14 @@ pub fn vfio_dma_map_guest_memory(
     guest_memory: &GuestMemoryMmap,
 ) -> Result<(), VfioError> {
     for region in guest_memory.iter() {
+        if region.region_type == GuestRegionType::Hotpluggable {
+            // Hermes: slots plugged before the container existed (a restored
+            // VM, or growth before the attach) must be DMA-mapped as well.
+            for slot in region.plugged_slots() {
+                vfio_dma_map_slot(container, &slot)?;
+            }
+            continue;
+        }
         if region.region_type == GuestRegionType::Dram {
             let region = &region.inner;
             let hva = region.as_ptr();
@@ -1500,6 +1555,33 @@ pub fn vfio_dma_map_guest_memory(
         }
     }
     Ok(())
+}
+
+/// DMA-map one plugged virtio-mem slot at its guest physical address.
+pub(crate) fn vfio_dma_map_slot(
+    container: &VfioContainer,
+    slot: &crate::vstate::memory::GuestMemorySlot<'_>,
+) -> Result<(), VfioError> {
+    let (iova, size, hva) = slot.dma_range();
+    debug!(
+        "DMA map virtio-mem slot: [{:#x}..{:#x}]",
+        iova,
+        iova + size as u64
+    );
+    // SAFETY: the slot is plugged guest memory that stays mapped until it is
+    // unplugged, which unmaps it from the container first.
+    unsafe { container.vfio_dma_map(iova, size, hva) }.map_err(VfioError::VfioIoctls)
+}
+
+/// DMA-unmap one virtio-mem slot before it is unplugged.
+pub(crate) fn vfio_dma_unmap_slot(
+    container: &VfioContainer,
+    slot: &crate::vstate::memory::GuestMemorySlot<'_>,
+) -> Result<(), VfioError> {
+    let (iova, size, _) = slot.dma_range();
+    container
+        .vfio_dma_unmap(iova, size)
+        .map_err(VfioError::VfioIoctls)
 }
 
 /// Create KVM_DEV_TYPE_VFIO device

@@ -51,6 +51,38 @@ pub struct CreateSnapshotParams {
     /// Activated virtio-block devices are always fsync'd, independently of this.
     #[serde(default = "default_sync_snapshot_files")]
     pub sync_snapshot_files: bool,
+    /// Hermes: where to stream each VFIO device's state. Every attached VFIO
+    /// device must be listed and support stop-and-copy migration.
+    #[serde(default)]
+    pub vfio_states: Vec<VfioStateTarget>,
+}
+
+/// Hermes: the file receiving one VFIO device's state.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VfioStateTarget {
+    /// The passthrough device id.
+    pub id: String,
+    /// Path of the device state file.
+    pub state_path: PathBuf,
+}
+
+/// Hermes: how to restore one VFIO device on snapshot load. The destination
+/// device (group node and name) may differ from the snapshotted one; it must
+/// be the same device model.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VfioOverride {
+    /// The passthrough device id.
+    pub id: String,
+    /// New VFIO group node, if it moved.
+    #[serde(default)]
+    pub group_path: Option<PathBuf>,
+    /// New device name (PCI address or mdev UUID), if it changed.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// Path of the device state file written at snapshot time.
+    pub state_path: PathBuf,
 }
 
 /// Default value for [CreateSnapshotParams::sync_snapshot_files].
@@ -119,6 +151,8 @@ pub struct LoadSnapshotParams {
     pub network_overrides: Vec<NetworkOverride>,
     /// When set, the vsock backend UDS path will be overridden
     pub vsock_override: Option<VsockOverride>,
+    /// Hermes: the VFIO devices to restore, with their state files.
+    pub vfio_overrides: Vec<VfioOverride>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore,
     /// advancing kvmclock by the wall-clock time elapsed since the snapshot was taken. When false
     /// (default), kvmclock resumes from where it was at snapshot time.
@@ -157,6 +191,9 @@ pub struct LoadSnapshotConfig {
     /// Whether or not to override the vsock backend UDS path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock_override: Option<VsockOverride>,
+    /// Hermes: the VFIO devices to restore, with their state files.
+    #[serde(default)]
+    pub vfio_overrides: Vec<VfioOverride>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore.
     #[serde(default)]
     pub clock_realtime: bool,
