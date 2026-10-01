@@ -244,17 +244,26 @@ impl VfioDevice {
 
 /// Open the device for `state` (with any override already applied), load
 /// its state and restore the VMM emulation at the saved guest addresses.
-/// The device is left in STOP; the VM's resume moves it to RUNNING. The
-/// container must already map guest memory.
+/// The device is left in STOP; the VM's resume moves it to RUNNING.
+///
+/// Guest memory must be DMA-mapped before the state is written, as QEMU
+/// does: a vendor driver may pin guest pages while it loads (the NVIDIA vGPU
+/// fixture maps RAM after the reset and before RESUMING). With
+/// `map_guest_memory` the container maps it here, once its first group is
+/// attached; later devices share the mapping.
 pub fn vfio_restore_device(
     container: &Arc<super::VfioContainer>,
     vm: &Arc<KvmVm>,
     state: &VfioDeviceState,
     state_path: &Path,
+    map_guest_memory: bool,
 ) -> Result<VfioDevice, VfioError> {
     let config = state.passthrough_config();
     let device = super::vfio_open_device(container, &config)?;
     device.reset();
+    if map_guest_memory {
+        super::vfio_dma_map_guest_memory(container, vm.guest_memory())?;
+    }
 
     let config_size = device
         .get_region_size(VFIO_PCI_CONFIG_REGION_INDEX)

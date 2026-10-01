@@ -329,9 +329,10 @@ impl PciDevices {
                 .get(&state.id)
                 .ok_or_else(|| VfioError::MissingStatePath(state.id.clone()))?
                 .clone();
-            let device = vfio_restore_device(&container, vm, state, &state_path)?;
+            // The first device's group attach lets the container map guest
+            // memory, which happens before that device's state is loaded.
+            let device = vfio_restore_device(&container, vm, state, &state_path, index == 0)?;
             if index == 0 {
-                vfio_dma_map_guest_memory(&container, vm.guest_memory())?;
                 vm.common.vfio_container.set(container.clone());
             }
             if let Some(gsi) = device.intx_gsi() {
