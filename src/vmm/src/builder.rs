@@ -138,6 +138,27 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
     }
 }
 
+/// Hermes: starts the thread that streams VFIO device state during a
+/// snapshot, for a VM with VFIO devices. It must start here, while the VMM
+/// thread may still create threads; it installs the VMM filter itself. A
+/// failure leaves snapshots streaming device state on the VMM thread.
+fn start_vfio_state_saver(vmm: &Vmm, seccomp_filters: &BpfThreadMap) {
+    let has_vfio = vmm
+        .device_manager
+        .pci_devices()
+        .is_some_and(|devices| !devices.vfio_devices.is_empty());
+    if !has_vfio {
+        return;
+    }
+    let Some(filter) = seccomp_filters.get("vmm") else {
+        crate::logger::warn!("No VMM seccomp filter for the VFIO state saver");
+        return;
+    };
+    if let Err(err) = crate::vfio::start_state_saver(filter.clone()) {
+        crate::logger::warn!("Could not start the VFIO state saver: {err}");
+    }
+}
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
 /// The built microVM and all the created vCPUs start off in the paused state.
@@ -359,6 +380,7 @@ pub fn build_microvm_for_boot(
         )
         .map_err(VmmError::VcpuStart)?;
     vmm.lock().unwrap().instance_info.state = VmState::Paused;
+    start_vfio_state_saver(&vmm.lock().unwrap(), seccomp_filters);
 
     #[cfg(feature = "gdb")]
     if let Some(gdb_socket_path) = &vm_resources.machine_config.gdb_socket_path {
@@ -543,6 +565,7 @@ pub fn build_microvm_from_snapshot(
 
     let vmm = Arc::new(Mutex::new(vmm));
     vmm.lock().unwrap().instance_info.state = VmState::Paused;
+    start_vfio_state_saver(&vmm.lock().unwrap(), seccomp_filters);
     event_manager.add_subscriber(vmm.clone());
 
     debug!("event_end: build microvm from snapshot");

@@ -375,6 +375,35 @@ impl DeviceManager {
         }
     }
 
+    /// Hermes: starts streaming every VFIO device's state on the state
+    /// saver thread, if it runs, returning what to wait on. `None` means the
+    /// caller streams it with [`Self::save_vfio_device_states`] instead.
+    pub fn save_vfio_device_states_in_background(
+        &self,
+        targets: &[crate::vmm_config::snapshot::VfioStateTarget],
+        sync: bool,
+    ) -> Result<
+        Option<std::sync::mpsc::Receiver<Result<(), crate::vfio::VfioError>>>,
+        crate::vfio::VfioError,
+    > {
+        let VirtioDevices::Pci(devices) = &self.virtio_devices else {
+            return Ok(None);
+        };
+        if devices.vfio_devices.is_empty() {
+            return Ok(None);
+        }
+        let mut saves = Vec::new();
+        for device in &devices.vfio_devices {
+            let id = device.lock().expect("Poisoned lock").config.id.clone();
+            let target = targets
+                .iter()
+                .find(|target| target.id == id)
+                .ok_or(crate::vfio::VfioError::MissingStatePath(id))?;
+            saves.push((device.clone(), target.state_path.clone()));
+        }
+        Ok(crate::vfio::save_states_in_background(saves, sync))
+    }
+
     /// Hermes: stream each VFIO device's state into its snapshot file.
     pub fn save_vfio_device_states(
         &self,

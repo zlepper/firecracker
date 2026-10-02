@@ -183,10 +183,11 @@ pub fn create_snapshot(
 /// the VFIO device state is read out:
 /// 1. the VM state, whose device saves may still write guest memory (a block
 ///    device drains its requests, vsock queues a reset event);
-/// 2. the memory dump, written in file order;
-/// 3. each VFIO device's state. The VM is paused, so the devices are in STOP
-///    and do no DMA, and reading their state does not touch guest memory;
-/// 4. the state file, carrying the streamed sizes.
+/// 2. the memory dump, written in file order, while each VFIO device's
+///    state streams on the state saver thread. The VM is paused, so the
+///    devices are in STOP and do no DMA, and reading their state does not
+///    touch guest memory;
+/// 3. the state file, carrying the streamed sizes.
 fn create_snapshot_files(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
@@ -211,15 +212,29 @@ fn create_snapshot_files(
             "snapshot requires KVM".into(),
         ))
     })?;
-    kvm_vm.snapshot_memory_to_file(
+    let background = vmm
+        .device_manager
+        .save_vfio_device_states_in_background(&params.vfio_states, params.sync_snapshot_files)
+        .map_err(not_allowed)?;
+    let dumped = kvm_vm.snapshot_memory_to_file(
         &params.mem_file_path,
         params.snapshot_type,
         params.sync_snapshot_files,
-    )?;
-
-    vmm.device_manager
-        .save_vfio_device_states(&params.vfio_states, params.sync_snapshot_files)
-        .map_err(not_allowed)?;
+    );
+    // The device save always finishes before the snapshot returns, even
+    // after a failed dump, so the devices are back in STOP.
+    let saved = match background {
+        Some(result) => result.recv().unwrap_or_else(|_| {
+            Err(crate::vfio::VfioError::MigrationUnsupported(
+                "VFIO state saver stopped".to_owned(),
+            ))
+        }),
+        None => vmm
+            .device_manager
+            .save_vfio_device_states(&params.vfio_states, params.sync_snapshot_files),
+    };
+    dumped?;
+    saved.map_err(not_allowed)?;
     if let crate::device_manager::VirtioDevicesState::Pci(pci) =
         &mut microvm_state.device_states.virtio_state
     {

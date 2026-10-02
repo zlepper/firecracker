@@ -11,6 +11,8 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use serde::{Deserialize, Serialize};
 use vfio_bindings::bindings::vfio::{
@@ -218,4 +220,72 @@ mod tests {
         assert_eq!(state_name(STATE_STOP_COPY), "STOP_COPY");
         assert_eq!(state_name(STATE_ERROR), "ERROR");
     }
+}
+
+/// Hermes: one VFIO device whose state a [`StateSaver`] streams.
+pub(crate) type StateSave = (Arc<Mutex<super::VfioDevice>>, PathBuf);
+
+struct StateSaveJob {
+    devices: Vec<StateSave>,
+    sync: bool,
+    done: mpsc::Sender<Result<(), VfioError>>,
+}
+
+/// Hermes: a thread that streams VFIO device state while the VMM thread
+/// dumps guest memory, so the vGPU's STOP_COPY (about a second for a T4)
+/// overlaps the dump. It starts while the VM is built, before the VMM
+/// thread's seccomp filter forbids new threads, and installs that same
+/// filter itself. A Firecracker process runs one VM, so there is one.
+pub(crate) struct StateSaver {
+    jobs: mpsc::Sender<StateSaveJob>,
+}
+
+static STATE_SAVER: OnceLock<StateSaver> = OnceLock::new();
+
+/// Starts the state saver, under the VMM thread's seccomp filter.
+pub fn start_state_saver(filter: Arc<crate::seccomp::BpfProgram>) -> std::io::Result<()> {
+    if STATE_SAVER.get().is_some() {
+        return Ok(());
+    }
+    let (jobs, inbox) = mpsc::channel::<StateSaveJob>();
+    std::thread::Builder::new()
+        .name("fc_vfio_save".to_owned())
+        .spawn(move || {
+            if let Err(err) = crate::seccomp::apply_filter(&filter) {
+                // Dropping the inbox fails every job; snapshots then stream
+                // device state on the VMM thread.
+                error!("VFIO state saver could not install its seccomp filter: {err}");
+                return;
+            }
+            for job in inbox {
+                let saved = job.devices.iter().try_for_each(|(device, path)| {
+                    device
+                        .lock()
+                        .expect("Poisoned lock")
+                        .save_device_state(path, job.sync)
+                });
+                let _ = job.done.send(saved);
+            }
+        })?;
+    let _ = STATE_SAVER.set(StateSaver { jobs });
+    Ok(())
+}
+
+/// Starts streaming `devices`' state on the state saver, if it runs. The
+/// caller must wait on the returned receiver before the snapshot ends.
+pub(crate) fn save_states_in_background(
+    devices: Vec<StateSave>,
+    sync: bool,
+) -> Option<mpsc::Receiver<Result<(), VfioError>>> {
+    let saver = STATE_SAVER.get()?;
+    let (done, result) = mpsc::channel();
+    saver
+        .jobs
+        .send(StateSaveJob {
+            devices,
+            sync,
+            done,
+        })
+        .ok()?;
+    Some(result)
 }

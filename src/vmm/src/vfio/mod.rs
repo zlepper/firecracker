@@ -43,7 +43,8 @@ mod migration;
 mod persist;
 use interrupts::{VfioIntx, VfioMsi, set_irq_mode};
 pub use interrupts::{VfioIntxState, VfioIrqMode, VfioMsiState};
-pub use migration::VfioMigrationSupport;
+pub(crate) use migration::save_states_in_background;
+pub use migration::{VfioMigrationSupport, start_state_saver};
 pub use persist::{
     VfioDeviceFingerprint, VfioDeviceState, VfioMsixSavedState, vfio_finish_restore,
     vfio_restore_device,
