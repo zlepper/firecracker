@@ -366,7 +366,11 @@ impl DeviceManager {
     pub fn vfio_saved_state_size(&self, id: &str) -> Option<u64> {
         match &self.virtio_devices {
             VirtioDevices::Pci(devices) => devices.vfio_devices.iter().find_map(|device| {
-                let device = device.lock().expect("Poisoned lock");
+                // The state saver thread may have panicked holding the lock;
+                // the snapshot then fails on its own result.
+                let device = device
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (device.config.id == id)
                     .then(|| device.saved_state_size())
                     .flatten()
@@ -429,7 +433,10 @@ impl DeviceManager {
     pub fn clear_vfio_saved_states(&self) {
         if let VirtioDevices::Pci(devices) = &self.virtio_devices {
             for device in &devices.vfio_devices {
-                device.lock().expect("Poisoned lock").clear_saved_state();
+                device
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear_saved_state();
             }
         }
     }
