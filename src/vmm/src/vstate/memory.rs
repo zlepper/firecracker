@@ -458,9 +458,14 @@ impl<'a> GuestMemorySlot<'a> {
         writer: &mut T,
         page_size: usize,
     ) -> Result<u64, MemoryError> {
-        // Copy a block at a time out of guest memory, then write its non-zero
-        // runs from the copy, so each byte is read from the guest once.
+        // Copy a block at a time out of guest memory, then write it from the
+        // copy, so each byte is read from the guest once. Only zero runs of
+        // at least `MINIMUM_HOLE_PAGES`, or ones at a block's edge, are left
+        // as holes: each write into a btrfs file costs far more than its
+        // bytes, and writing around every zero page ran at a fifteenth of
+        // the speed of whole blocks.
         const BLOCK_PAGES: usize = 512;
+        const MINIMUM_HOLE_PAGES: usize = 64;
         let mut block = vec![0u8; BLOCK_PAGES * page_size];
         let mut skip: usize = 0;
         let mut written: u64 = 0;
@@ -469,27 +474,42 @@ impl<'a> GuestMemorySlot<'a> {
             let length = (self.slice.len() - offset).min(block.len());
             let copy = &mut block[..length];
             self.slice.subslice(offset, length)?.copy_to(&mut *copy);
+            // `cursor` is the first byte of this block not yet written or
+            // skipped; `zeros` the start of the zero run being scanned.
+            let mut cursor = 0;
+            let mut zeros = None;
             let mut page = 0;
             while page < length {
                 let end = (page + page_size).min(length);
                 if is_zero(&copy[page..end]) {
-                    skip += end - page;
+                    zeros.get_or_insert(page);
                     page = end;
                     continue;
                 }
-                let mut run_end = end;
-                while run_end < length {
-                    let next = (run_end + page_size).min(length);
-                    if is_zero(&copy[run_end..next]) {
-                        break;
+                if let Some(start) = zeros.take() {
+                    // A leading run, or a long one, becomes a hole.
+                    if start == cursor || page - start >= MINIMUM_HOLE_PAGES * page_size {
+                        if start > cursor {
+                            seek_forward(writer, &mut skip)?;
+                            writer.write_all_volatile(&VolatileSlice::from(
+                                &mut copy[cursor..start],
+                            ))?;
+                            written += (start - cursor) as u64;
+                        }
+                        skip += page - start;
+                        cursor = page;
                     }
-                    run_end = next;
                 }
-                seek_forward(writer, &mut skip)?;
-                writer.write_all_volatile(&VolatileSlice::from(&mut copy[page..run_end]))?;
-                written += (run_end - page) as u64;
-                page = run_end;
+                page = end;
             }
+            // A trailing zero run becomes a hole.
+            let data_end = zeros.unwrap_or(length);
+            if data_end > cursor {
+                seek_forward(writer, &mut skip)?;
+                writer.write_all_volatile(&VolatileSlice::from(&mut copy[cursor..data_end]))?;
+                written += (data_end - cursor) as u64;
+            }
+            skip += length - data_end.max(cursor);
             offset += length;
         }
         // Advance over trailing zero pages so the next slot starts at the
@@ -1739,13 +1759,14 @@ mod tests {
         let total_size = page_size * 16;
         memory_file.set_len(total_size as u64).unwrap();
         let written = guest_memory.dump_sparse(&mut memory_file).unwrap();
-        assert_eq!(written, (page_size * 4) as u64);
-
-        // Only the four non-zero pages are allocated.
+        // The short zero gap between the lone page and the page ending in a
+        // byte is written as data; the zeros leading and trailing each
+        // block are holes.
+        assert_eq!(written, (page_size * 6) as u64);
         let allocated = memory_file.metadata().unwrap().blocks() * 512;
         assert!(
-            allocated <= (page_size * 4) as u64,
-            "allocated {allocated} bytes for four data pages"
+            allocated <= (page_size * 6) as u64,
+            "allocated {allocated} bytes for six written pages"
         );
 
         // The file reads back exactly as guest memory.
@@ -1767,6 +1788,50 @@ mod tests {
                 .unwrap();
             assert_eq!(original, restored);
         }
+    }
+
+    #[test]
+    fn test_dump_sparse_leaves_long_zero_runs_as_holes() {
+        let page_size = host_page_size();
+        let pages = 200;
+        let guest_memory = into_region_ext(
+            anonymous(
+                [(GuestAddress(0), page_size * pages)].into_iter(),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        // Data at page 0, a 100-page hole, then pages 101 and 105 with a
+        // short gap between them.
+        for page in [0u64, 101, 105] {
+            guest_memory
+                .write(&vec![3u8; page_size], GuestAddress(page * page_size as u64))
+                .unwrap();
+        }
+        let memory_state = guest_memory.describe();
+        let mut memory_file = TempFile::new().unwrap().into_file();
+        memory_file.set_len((page_size * pages) as u64).unwrap();
+        let written = guest_memory.dump_sparse(&mut memory_file).unwrap();
+        assert_eq!(written, (page_size * 6) as u64);
+        let restored_guest_memory = into_region_ext(
+            snapshot_file(
+                memory_file,
+                memory_state.regions(),
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        let mut original = vec![0u8; page_size * pages];
+        let mut restored = vec![0u8; page_size * pages];
+        guest_memory
+            .read(original.as_mut_slice(), GuestAddress(0))
+            .unwrap();
+        restored_guest_memory
+            .read(restored.as_mut_slice(), GuestAddress(0))
+            .unwrap();
+        assert_eq!(original, restored);
     }
 
     #[test]

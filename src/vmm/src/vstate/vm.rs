@@ -665,7 +665,13 @@ impl KvmVm {
             //   would be reflected in the mmap of the file, meaning a truncate operation would zero
             //   out guest memory, and thus corrupt the VM).
             // - For diff snapshots, we want to merge the diff layer directly into the file.
-            if file_size != expected_size {
+            // Hermes: an empty file already reads as zeros once extended.
+            // Truncating it would make btrfs flush the whole dump when the
+            // file is closed (`BTRFS_INODE_FLUSH_ON_CLOSE`), which costs as
+            // much as the fsync a migration skips.
+            if file_size == 0 {
+                zeroed = true;
+            } else if file_size != expected_size {
                 file.set_len(0)
                     .map_err(|err| MemoryBackingFile("truncate", err))?;
                 zeroed = true;

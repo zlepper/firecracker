@@ -217,6 +217,21 @@ pub fn create_snapshot(
     Ok(())
 }
 
+/// Opens `path` for writing from its start, truncating it only when it is
+/// not already empty. Hermes pre-creates the file empty; a truncate to zero,
+/// even of an empty file, makes btrfs flush the whole file when it is closed.
+pub(crate) fn open_for_overwrite(path: &Path) -> std::io::Result<File> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    if file.metadata()?.len() != 0 {
+        file.set_len(0)?;
+    }
+    Ok(file)
+}
+
 fn snapshot_state_to_file(
     microvm_state: &MicrovmState,
     snapshot_path: &Path,
@@ -224,12 +239,8 @@ fn snapshot_state_to_file(
 ) -> Result<(), CreateSnapshotError> {
     use self::CreateSnapshotError::*;
     let mut span = crate::hermes_trace::Span::start("snapshot.state_file");
-    let mut snapshot_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(snapshot_path)
-        .map_err(|err| SnapshotBackingFile("open", err))?;
+    let mut snapshot_file =
+        open_for_overwrite(snapshot_path).map_err(|err| SnapshotBackingFile("open", err))?;
 
     let snapshot = Snapshot::new(microvm_state);
     snapshot.save(&mut snapshot_file)?;

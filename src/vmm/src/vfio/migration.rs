@@ -131,12 +131,7 @@ pub fn unquiesce(
 /// Stream the state of a stopped device into `path`, returning its size.
 /// The device goes STOP -> STOP_COPY -> STOP.
 pub fn save_state(device: &InternalVfioDevice, path: &Path, sync: bool) -> Result<u64, VfioError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(VfioError::StateFile)?;
+    let mut file = crate::persist::open_for_overwrite(path).map_err(VfioError::StateFile)?;
     let mut span = crate::hermes_trace::Span::start("vfio.stop_copy");
     set_state(device, STATE_STOP_COPY)?;
     let copied = copy_out(device, &mut file);
