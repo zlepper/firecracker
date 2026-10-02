@@ -637,6 +637,9 @@ impl KvmVm {
 
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
+        // Whether the file reads as all zeros before the dump: then a full
+        // snapshot can leave zero pages as holes.
+        let mut zeroed = !file_existed;
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -665,6 +668,7 @@ impl KvmVm {
             if file_size != expected_size {
                 file.set_len(0)
                     .map_err(|err| MemoryBackingFile("truncate", err))?;
+                zeroed = true;
             }
         }
 
@@ -676,6 +680,13 @@ impl KvmVm {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+            }
+            // A file that may hold earlier contents (possibly this VM's own
+            // private backing) is written densely; a zeroed one sparsely.
+            SnapshotType::Full if zeroed => {
+                self.guest_memory().dump_sparse(&mut file)?;
+                self.reset_dirty_bitmap();
+                self.guest_memory().reset_dirty();
             }
             SnapshotType::Full => {
                 self.guest_memory().dump(&mut file)?;

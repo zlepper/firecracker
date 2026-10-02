@@ -448,6 +448,53 @@ impl<'a> GuestMemorySlot<'a> {
         )
     }
 
+    /// Dumps this slot onto a writer whose target already reads as zeros (a
+    /// file just created or truncated), seeking over all-zero pages instead
+    /// of writing them, so the file keeps holes there. Guest memory is
+    /// usually mostly zero pages, which a sparse file stores and later
+    /// copies for free.
+    pub(crate) fn dump_sparse<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        page_size: usize,
+    ) -> Result<(), MemoryError> {
+        // Copy a block at a time out of guest memory, then write its non-zero
+        // runs from the copy, so each byte is read from the guest once.
+        const BLOCK_PAGES: usize = 512;
+        let mut block = vec![0u8; BLOCK_PAGES * page_size];
+        let mut skip: usize = 0;
+        let mut offset = 0;
+        while offset < self.slice.len() {
+            let length = (self.slice.len() - offset).min(block.len());
+            let copy = &mut block[..length];
+            self.slice.subslice(offset, length)?.copy_to(&mut *copy);
+            let mut page = 0;
+            while page < length {
+                let end = (page + page_size).min(length);
+                if is_zero(&copy[page..end]) {
+                    skip += end - page;
+                    page = end;
+                    continue;
+                }
+                let mut run_end = end;
+                while run_end < length {
+                    let next = (run_end + page_size).min(length);
+                    if is_zero(&copy[run_end..next]) {
+                        break;
+                    }
+                    run_end = next;
+                }
+                seek_forward(writer, &mut skip)?;
+                writer.write_all_volatile(&VolatileSlice::from(&mut copy[page..run_end]))?;
+                page = run_end;
+            }
+            offset += length;
+        }
+        // Advance over trailing zero pages so the next slot starts at the
+        // correct offset.
+        seek_forward(writer, &mut skip)
+    }
+
     /// Dumps the dirty pages in this slot onto the writer
     pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
@@ -1018,6 +1065,25 @@ pub fn snapshot_file(
     )
 }
 
+/// Whether every byte is zero; folds 64-byte chunks so the check vectorizes.
+fn is_zero(bytes: &[u8]) -> bool {
+    bytes
+        .chunks(64)
+        .all(|chunk| chunk.iter().fold(0u8, |acc, byte| acc | byte) == 0)
+}
+
+/// Seeks the writer forward by `skip` bytes, if any, and resets it.
+fn seek_forward<T: std::io::Seek>(writer: &mut T, skip: &mut usize) -> Result<(), MemoryError> {
+    if *skip > 0 {
+        let offset = i64::try_from(*skip).map_err(|_| MemoryError::SlotSizeTooLarge)?;
+        writer
+            .seek(SeekFrom::Current(offset))
+            .map_err(MemoryError::SeekError)?;
+        *skip = 0;
+    }
+    Ok(())
+}
+
 /// Defines the interface for snapshotting memory.
 pub trait GuestMemoryExtension
 where
@@ -1031,6 +1097,14 @@ where
 
     /// Dumps all contents of GuestMemoryMmap to a writer.
     fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
+
+    /// Dumps all contents of GuestMemoryMmap to a writer whose target already
+    /// reads as zeros, leaving zero pages as holes (see
+    /// [`GuestMemorySlot::dump_sparse`]).
+    fn dump_sparse<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), MemoryError>;
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
@@ -1132,6 +1206,23 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                 Ok(())
             })
             .map_err(MemoryError::WriteMemory)
+    }
+
+    fn dump_sparse<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), MemoryError> {
+        let page_size = host_page_size();
+        self.iter()
+            .flat_map(|region| region.slots())
+            .try_for_each(|(mem_slot, plugged)| {
+                if plugged {
+                    mem_slot.dump_sparse(writer, page_size)
+                } else {
+                    let mut skip = mem_slot.slice.len();
+                    seek_forward(writer, &mut skip)
+                }
+            })
     }
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
@@ -1608,6 +1699,69 @@ mod tests {
             .read(restored_region.as_mut_slice(), region_2_address)
             .unwrap();
         assert_eq!(second_region, restored_region);
+    }
+
+    #[test]
+    fn test_dump_sparse() {
+        let page_size = host_page_size();
+        // Two regions of eight pages each, with a one page gap between them,
+        // holding data in three pages: a lone page, then a run of two that
+        // ends exactly at a region boundary.
+        let region_1_address = GuestAddress(0);
+        let region_2_address = GuestAddress(page_size as u64 * 9);
+        let region_size = page_size * 8;
+        let mem_regions = [
+            (region_1_address, region_size),
+            (region_2_address, region_size),
+        ];
+        let guest_memory = into_region_ext(
+            anonymous(mem_regions.into_iter(), true, HugePageConfig::None).unwrap(),
+        );
+        let lone = vec![7u8; page_size];
+        guest_memory
+            .write(&lone, GuestAddress(page_size as u64 * 2))
+            .unwrap();
+        let run = vec![9u8; page_size * 2];
+        guest_memory
+            .write(&run, GuestAddress(page_size as u64 * 15))
+            .unwrap();
+        // A page with a single non-zero byte at its end is not a zero page.
+        guest_memory
+            .write(&[1u8], GuestAddress(page_size as u64 * 6 - 1))
+            .unwrap();
+
+        let memory_state = guest_memory.describe();
+        let mut memory_file = TempFile::new().unwrap().into_file();
+        let total_size = page_size * 16;
+        memory_file.set_len(total_size as u64).unwrap();
+        guest_memory.dump_sparse(&mut memory_file).unwrap();
+
+        // Only the four non-zero pages are allocated.
+        let allocated = memory_file.metadata().unwrap().blocks() * 512;
+        assert!(
+            allocated <= (page_size * 4) as u64,
+            "allocated {allocated} bytes for four data pages"
+        );
+
+        // The file reads back exactly as guest memory.
+        let restored_guest_memory = into_region_ext(
+            snapshot_file(
+                memory_file,
+                memory_state.regions(),
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        for address in [region_1_address, region_2_address] {
+            let mut original = vec![0u8; region_size];
+            let mut restored = vec![0u8; region_size];
+            guest_memory.read(original.as_mut_slice(), address).unwrap();
+            restored_guest_memory
+                .read(restored.as_mut_slice(), address)
+                .unwrap();
+            assert_eq!(original, restored);
+        }
     }
 
     #[test]
