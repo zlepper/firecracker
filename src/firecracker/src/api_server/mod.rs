@@ -124,6 +124,25 @@ impl ApiServer {
         request: &Request,
         request_processing_start_us: u64,
     ) -> Response {
+        // Hermes: the caller's trace context parents the spans this request
+        // runs (`vmm::hermes_trace`).
+        let traceparent = request
+            .headers
+            .custom_entries()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("traceparent"))
+            .map(|(_, value)| value.as_str());
+        vmm::hermes_trace::set_context(traceparent);
+        let response = self.handle_parsed_request(request, request_processing_start_us);
+        vmm::hermes_trace::set_context(None);
+        response
+    }
+
+    fn handle_parsed_request(
+        &mut self,
+        request: &Request,
+        request_processing_start_us: u64,
+    ) -> Response {
         match ParsedRequest::try_from(request).map(|r| r.into_parts()) {
             Ok((req_action, mut parsing_info)) => {
                 let mut response = match req_action {
@@ -168,6 +187,14 @@ impl ApiServer {
             _ => None,
         };
 
+        let _span = metric_with_action.map(|(_, action)| {
+            vmm::hermes_trace::Span::start(match action {
+                "create full snapshot" | "create diff snapshot" => "api.create_snapshot",
+                "load snapshot" => "api.load_snapshot",
+                "pause vm" => "api.pause",
+                _ => "api.resume",
+            })
+        });
         self.api_request_sender
             .send(vmm_action)
             .expect("Failed to send VMM message");

@@ -457,12 +457,13 @@ impl<'a> GuestMemorySlot<'a> {
         &self,
         writer: &mut T,
         page_size: usize,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<u64, MemoryError> {
         // Copy a block at a time out of guest memory, then write its non-zero
         // runs from the copy, so each byte is read from the guest once.
         const BLOCK_PAGES: usize = 512;
         let mut block = vec![0u8; BLOCK_PAGES * page_size];
         let mut skip: usize = 0;
+        let mut written: u64 = 0;
         let mut offset = 0;
         while offset < self.slice.len() {
             let length = (self.slice.len() - offset).min(block.len());
@@ -486,13 +487,15 @@ impl<'a> GuestMemorySlot<'a> {
                 }
                 seek_forward(writer, &mut skip)?;
                 writer.write_all_volatile(&VolatileSlice::from(&mut copy[page..run_end]))?;
+                written += (run_end - page) as u64;
                 page = run_end;
             }
             offset += length;
         }
         // Advance over trailing zero pages so the next slot starts at the
         // correct offset.
-        seek_forward(writer, &mut skip)
+        seek_forward(writer, &mut skip)?;
+        Ok(written)
     }
 
     /// Dumps the dirty pages in this slot onto the writer
@@ -1100,11 +1103,11 @@ where
 
     /// Dumps all contents of GuestMemoryMmap to a writer whose target already
     /// reads as zeros, leaving zero pages as holes (see
-    /// [`GuestMemorySlot::dump_sparse`]).
+    /// [`GuestMemorySlot::dump_sparse`]), and returns the bytes written.
     fn dump_sparse<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
-    ) -> Result<(), MemoryError>;
+    ) -> Result<u64, MemoryError>;
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
@@ -1211,16 +1214,17 @@ impl GuestMemoryExtension for GuestMemoryMmap {
     fn dump_sparse<T: WriteVolatile + std::io::Seek>(
         &self,
         writer: &mut T,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<u64, MemoryError> {
         let page_size = host_page_size();
         self.iter()
             .flat_map(|region| region.slots())
-            .try_for_each(|(mem_slot, plugged)| {
+            .try_fold(0, |written, (mem_slot, plugged)| {
                 if plugged {
-                    mem_slot.dump_sparse(writer, page_size)
+                    Ok(written + mem_slot.dump_sparse(writer, page_size)?)
                 } else {
                     let mut skip = mem_slot.slice.len();
-                    seek_forward(writer, &mut skip)
+                    seek_forward(writer, &mut skip)?;
+                    Ok(written)
                 }
             })
     }
@@ -1734,7 +1738,8 @@ mod tests {
         let mut memory_file = TempFile::new().unwrap().into_file();
         let total_size = page_size * 16;
         memory_file.set_len(total_size as u64).unwrap();
-        guest_memory.dump_sparse(&mut memory_file).unwrap();
+        let written = guest_memory.dump_sparse(&mut memory_file).unwrap();
+        assert_eq!(written, (page_size * 4) as u64);
 
         // Only the four non-zero pages are allocated.
         let allocated = memory_file.metadata().unwrap().blocks() * 512;

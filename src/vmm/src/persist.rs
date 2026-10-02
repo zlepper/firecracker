@@ -176,6 +176,7 @@ pub fn create_snapshot(
     // Hermes: stream every VFIO device's state first. The VM is paused, so
     // the devices are stopped; a device without a state file, or one that
     // cannot migrate, makes the snapshot fail.
+    let _span = crate::hermes_trace::Span::start("snapshot.create");
     let streamed = vmm
         .device_manager
         .save_vfio_device_states(&params.vfio_states, params.sync_snapshot_files)
@@ -183,6 +184,7 @@ pub fn create_snapshot(
             CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(err.to_string()))
         });
     let microvm_state = streamed.and_then(|()| {
+        let _span = crate::hermes_trace::Span::start("snapshot.vm_state");
         vmm.save_state(vm_info)
             .map_err(CreateSnapshotError::MicrovmState)
     });
@@ -221,6 +223,7 @@ fn snapshot_state_to_file(
     sync_snapshot_files: bool,
 ) -> Result<(), CreateSnapshotError> {
     use self::CreateSnapshotError::*;
+    let mut span = crate::hermes_trace::Span::start("snapshot.state_file");
     let mut snapshot_file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -233,7 +236,12 @@ fn snapshot_state_to_file(
     snapshot_file
         .flush()
         .map_err(|err| SnapshotBackingFile("flush", err))?;
+    if let Ok(metadata) = snapshot_file.metadata() {
+        span.record("bytes", metadata.len());
+    }
+    drop(span);
     if sync_snapshot_files {
+        let _span = crate::hermes_trace::Span::start("snapshot.state_sync");
         snapshot_file
             .sync_all()
             .map_err(|err| SnapshotBackingFile("sync_all", err))?;
@@ -395,7 +403,11 @@ pub fn restore_from_snapshot(
     params: &LoadSnapshotParams,
     vm_resources: &mut VmResources,
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
-    let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
+    let _restore_span = crate::hermes_trace::Span::start("restore.load");
+    let mut microvm_state = {
+        let _span = crate::hermes_trace::Span::start("restore.state_file");
+        snapshot_state_from_file(&params.snapshot_path)?
+    };
     for entry in &params.network_overrides {
         // Only the active transport carries virtio device state, so we look at whichever
         // variant this snapshot was saved with. The MMIO and PCI transports wrap their net
@@ -498,6 +510,7 @@ pub fn restore_from_snapshot(
                 )
                 .into());
             }
+            let _span = crate::hermes_trace::Span::start("restore.memory_map");
             (
                 guest_memory_from_file(
                     mem_backend_path,
@@ -517,6 +530,7 @@ pub fn restore_from_snapshot(
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
+    let _span = crate::hermes_trace::Span::start("restore.build");
     builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,

@@ -676,6 +676,8 @@ impl KvmVm {
         file.set_len(expected_size)
             .map_err(|e| MemoryBackingFile("set_length", e))?;
 
+        let mut span = crate::hermes_trace::Span::start("snapshot.memory_dump");
+        span.record("bytes", expected_size);
         match snapshot_type {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
@@ -684,7 +686,7 @@ impl KvmVm {
             // A file that may hold earlier contents (possibly this VM's own
             // private backing) is written densely; a zeroed one sparsely.
             SnapshotType::Full if zeroed => {
-                self.guest_memory().dump_sparse(&mut file)?;
+                span.record("written_bytes", self.guest_memory().dump_sparse(&mut file)?);
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }
@@ -697,7 +699,9 @@ impl KvmVm {
 
         file.flush()
             .map_err(|err| MemoryBackingFile("flush", err))?;
+        drop(span);
         if sync_snapshot_files {
+            let _span = crate::hermes_trace::Span::start("snapshot.memory_sync");
             file.sync_all()
                 .map_err(|err| MemoryBackingFile("sync_all", err))?;
         }

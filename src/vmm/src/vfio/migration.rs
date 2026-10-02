@@ -137,13 +137,17 @@ pub fn save_state(device: &InternalVfioDevice, path: &Path, sync: bool) -> Resul
         .truncate(true)
         .open(path)
         .map_err(VfioError::StateFile)?;
+    let mut span = crate::hermes_trace::Span::start("vfio.stop_copy");
     set_state(device, STATE_STOP_COPY)?;
     let copied = copy_out(device, &mut file);
     // Always leave STOP_COPY, even when the copy failed.
     let stopped = set_state(device, STATE_STOP);
     let size = copied?;
     stopped?;
+    span.record("bytes", size);
+    drop(span);
     if sync {
+        let _span = crate::hermes_trace::Span::start("vfio.state_sync");
         file.sync_all().map_err(VfioError::StateFile)?;
     }
     info!("VFIO device state saved: {size} bytes");
@@ -178,6 +182,8 @@ pub fn begin_load(
     if size != expected_size {
         return Err(VfioError::StateSizeMismatch(expected_size, size));
     }
+    let mut span = crate::hermes_trace::Span::start("vfio.resume_load");
+    span.record("bytes", size);
     set_state(device, STATE_STOP)?;
     set_state(device, STATE_RESUMING)?;
     let mut buffer = vec![0u8; STATE_CHUNK];

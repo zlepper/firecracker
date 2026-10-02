@@ -87,6 +87,7 @@ pub mod dumbo;
 #[cfg(feature = "gdb")]
 pub mod gdb;
 /// Logger
+pub mod hermes_trace;
 pub mod logger;
 /// microVM Metadata Service MMDS
 pub mod mmds;
@@ -483,6 +484,7 @@ impl Vmm {
 
     /// Sends a resume command to the vCPUs.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
+        let _span = crate::hermes_trace::Span::start("vm.resume");
         let kvm_vm = self
             .vm
             .as_kvm()
@@ -499,6 +501,7 @@ impl Vmm {
 
     /// Sends a pause command to the vCPUs.
     pub fn pause_vm(&mut self) -> Result<(), VmmError> {
+        let _span = crate::hermes_trace::Span::start("vm.pause");
         let kvm_vm = self
             .vm
             .as_kvm()
