@@ -342,6 +342,39 @@ impl DeviceManager {
         Ok(())
     }
 
+    /// Hermes: check that every VFIO device can stream its state and has a
+    /// file for it, and mark it as streaming for the snapshot being taken.
+    pub fn prepare_vfio_state_saves(
+        &self,
+        targets: &[crate::vmm_config::snapshot::VfioStateTarget],
+    ) -> Result<(), crate::vfio::VfioError> {
+        if let VirtioDevices::Pci(devices) = &self.virtio_devices {
+            for device in &devices.vfio_devices {
+                let mut device = device.lock().expect("Poisoned lock");
+                if !targets.iter().any(|target| target.id == device.config.id) {
+                    return Err(crate::vfio::VfioError::MissingStatePath(
+                        device.config.id.clone(),
+                    ));
+                }
+                device.prepare_state_save()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Hermes: the size of the state streamed for VFIO device `id`.
+    pub fn vfio_saved_state_size(&self, id: &str) -> Option<u64> {
+        match &self.virtio_devices {
+            VirtioDevices::Pci(devices) => devices.vfio_devices.iter().find_map(|device| {
+                let device = device.lock().expect("Poisoned lock");
+                (device.config.id == id)
+                    .then(|| device.saved_state_size())
+                    .flatten()
+            }),
+            VirtioDevices::Mmio(_) => None,
+        }
+    }
+
     /// Hermes: stream each VFIO device's state into its snapshot file.
     pub fn save_vfio_device_states(
         &self,

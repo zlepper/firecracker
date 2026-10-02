@@ -8,7 +8,7 @@
 //! STOP whenever the VM is paused, its state is streamed in STOP_COPY, and a
 //! destination device is loaded in RESUMING. PRE_COPY is not used.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 

@@ -151,14 +151,34 @@ impl VfioDevice {
         Ok(())
     }
 
-    /// Whether the device state was streamed for the snapshot being taken.
+    /// Hermes: commit to streaming this device's state for the snapshot
+    /// being taken. It is streamed after the VM state is saved and memory
+    /// is dumped, so the host can send memory while the device state is
+    /// read out; checking first keeps a device that cannot migrate from
+    /// starting a snapshot.
+    pub fn prepare_state_save(&mut self) -> Result<(), VfioError> {
+        if !self.migration.stop_copy() {
+            return Err(VfioError::MigrationUnsupported(self.config.id.clone()));
+        }
+        self.state_pending = true;
+        Ok(())
+    }
+
+    /// Whether the device state streams, or was streamed, for the snapshot
+    /// being taken.
     pub fn has_saved_state(&self) -> bool {
-        self.saved_state_size.is_some()
+        self.state_pending || self.saved_state_size.is_some()
+    }
+
+    /// The size of the state streamed for the snapshot being taken.
+    pub fn saved_state_size(&self) -> Option<u64> {
+        self.saved_state_size
     }
 
     /// Forget the streamed state once the snapshot is written.
     pub fn clear_saved_state(&mut self) {
         self.saved_state_size = None;
+        self.state_pending = false;
     }
 
     /// The VMM side of the device for the VM state file.
@@ -348,6 +368,7 @@ pub fn vfio_restore_device(
         migration: migration_support,
         fingerprint,
         saved_state_size: None,
+        state_pending: false,
         vm: vm.clone(),
     };
     vfio_device.replay_config(state);

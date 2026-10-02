@@ -222,6 +222,9 @@ pub struct VfioDevice {
     fingerprint: VfioDeviceFingerprint,
     /// Size of the state streamed for the snapshot being taken.
     saved_state_size: Option<u64>,
+    /// Whether this device's state streams for the snapshot being taken,
+    /// after the memory dump.
+    state_pending: bool,
     vm: Arc<KvmVm>,
 }
 
@@ -1504,6 +1507,7 @@ fn vfio_init_device(
         migration: migration_support,
         fingerprint,
         saved_state_size: None,
+        state_pending: false,
         vm: vm.clone(),
     };
     // A freshly reset device starts in INTx mode, if it has INTx.

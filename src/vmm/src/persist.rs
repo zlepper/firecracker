@@ -173,29 +173,38 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    // Hermes: stream every VFIO device's state first. The VM is paused, so
-    // the devices are stopped; a device without a state file, or one that
-    // cannot migrate, makes the snapshot fail.
     let _span = crate::hermes_trace::Span::start("snapshot.create");
-    let streamed = vmm
-        .device_manager
-        .save_vfio_device_states(&params.vfio_states, params.sync_snapshot_files)
-        .map_err(|err| {
-            CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(err.to_string()))
-        });
-    let microvm_state = streamed.and_then(|()| {
+    let created = create_snapshot_files(vmm, vm_info, params);
+    vmm.device_manager.clear_vfio_saved_states();
+    created
+}
+
+/// Hermes: the snapshot in the order that lets the host stream memory while
+/// the VFIO device state is read out:
+/// 1. the VM state, whose device saves may still write guest memory (a block
+///    device drains its requests, vsock queues a reset event);
+/// 2. the memory dump, written in file order;
+/// 3. each VFIO device's state. The VM is paused, so the devices are in STOP
+///    and do no DMA, and reading their state does not touch guest memory;
+/// 4. the state file, carrying the streamed sizes.
+fn create_snapshot_files(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<(), CreateSnapshotError> {
+    let not_allowed = |err: crate::vfio::VfioError| {
+        CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(err.to_string()))
+    };
+    // A device without a state file, or one that cannot migrate, makes the
+    // snapshot fail before anything is written.
+    vmm.device_manager
+        .prepare_vfio_state_saves(&params.vfio_states)
+        .map_err(not_allowed)?;
+    let mut microvm_state = {
         let _span = crate::hermes_trace::Span::start("snapshot.vm_state");
         vmm.save_state(vm_info)
-            .map_err(CreateSnapshotError::MicrovmState)
-    });
-    vmm.device_manager.clear_vfio_saved_states();
-    let microvm_state = microvm_state?;
-
-    snapshot_state_to_file(
-        &microvm_state,
-        &params.snapshot_path,
-        params.sync_snapshot_files,
-    )?;
+            .map_err(CreateSnapshotError::MicrovmState)?
+    };
 
     let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
         CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
@@ -205,6 +214,31 @@ pub fn create_snapshot(
     kvm_vm.snapshot_memory_to_file(
         &params.mem_file_path,
         params.snapshot_type,
+        params.sync_snapshot_files,
+    )?;
+
+    vmm.device_manager
+        .save_vfio_device_states(&params.vfio_states, params.sync_snapshot_files)
+        .map_err(not_allowed)?;
+    if let crate::device_manager::VirtioDevicesState::Pci(pci) =
+        &mut microvm_state.device_states.virtio_state
+    {
+        for device in &mut pci.vfio_devices {
+            device.state_size = vmm
+                .device_manager
+                .vfio_saved_state_size(&device.id)
+                .ok_or_else(|| {
+                    CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(format!(
+                        "VFIO device {} streamed no state",
+                        device.id
+                    )))
+                })?;
+        }
+    }
+
+    snapshot_state_to_file(
+        &microvm_state,
+        &params.snapshot_path,
         params.sync_snapshot_files,
     )?;
 
