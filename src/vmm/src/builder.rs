@@ -138,26 +138,31 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
     }
 }
 
-/// Hermes: starts the thread that streams VFIO device state during a
-/// snapshot, for a VM with VFIO devices. It must start here, while the VMM
-/// thread may still create threads; it installs the VMM filter itself. A
-/// failure leaves snapshots streaming device state on the VMM thread.
-fn start_vfio_state_saver(vmm: &Vmm, seccomp_filters: &BpfThreadMap) {
+/// Hermes: the threads that help take a snapshot: [`DUMP_HELPER_THREADS`]
+/// that copy guest memory out for a sparse dump, and, for a VM with VFIO
+/// devices, one that streams their state. They must start here, while the
+/// VMM thread may still create threads; each installs the VMM filter itself.
+/// A failure leaves snapshots doing that work on the VMM thread.
+fn start_snapshot_helpers(vmm: &Vmm, seccomp_filters: &BpfThreadMap) {
+    let Some(filter) = seccomp_filters.get("vmm") else {
+        crate::logger::warn!("No VMM seccomp filter for the snapshot helpers");
+        return;
+    };
+    if let Err(err) = crate::vstate::memory::start_dump_helpers(filter.clone(), DUMP_HELPER_THREADS)
+    {
+        crate::logger::warn!("Could not start the memory dump helpers: {err}");
+    }
     let has_vfio = vmm
         .device_manager
         .pci_devices()
         .is_some_and(|devices| !devices.vfio_devices.is_empty());
-    if !has_vfio {
-        return;
-    }
-    let Some(filter) = seccomp_filters.get("vmm") else {
-        crate::logger::warn!("No VMM seccomp filter for the VFIO state saver");
-        return;
-    };
-    if let Err(err) = crate::vfio::start_state_saver(filter.clone()) {
+    if has_vfio && let Err(err) = crate::vfio::start_state_saver(filter.clone()) {
         crate::logger::warn!("Could not start the VFIO state saver: {err}");
     }
 }
+
+/// Hermes: threads that copy guest memory out during a sparse dump.
+const DUMP_HELPER_THREADS: usize = 4;
 
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
@@ -380,7 +385,7 @@ pub fn build_microvm_for_boot(
         )
         .map_err(VmmError::VcpuStart)?;
     vmm.lock().unwrap().instance_info.state = VmState::Paused;
-    start_vfio_state_saver(&vmm.lock().unwrap(), seccomp_filters);
+    start_snapshot_helpers(&vmm.lock().unwrap(), seccomp_filters);
 
     #[cfg(feature = "gdb")]
     if let Some(gdb_socket_path) = &vm_resources.machine_config.gdb_socket_path {
@@ -565,7 +570,7 @@ pub fn build_microvm_from_snapshot(
 
     let vmm = Arc::new(Mutex::new(vmm));
     vmm.lock().unwrap().instance_info.state = VmState::Paused;
-    start_vfio_state_saver(&vmm.lock().unwrap(), seccomp_filters);
+    start_snapshot_helpers(&vmm.lock().unwrap(), seccomp_filters);
     event_manager.add_subscriber(vmm.clone());
 
     debug!("event_end: build microvm from snapshot");

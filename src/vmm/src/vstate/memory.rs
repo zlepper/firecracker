@@ -85,6 +85,8 @@ pub enum MemoryError {
     DirtyBitmapTooSmall,
     /// Seek error: {0}
     SeekError(std::io::Error),
+    /// A dump helper thread stopped before finishing its block
+    DumpHelperStopped,
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
 }
@@ -458,15 +460,9 @@ impl<'a> GuestMemorySlot<'a> {
         writer: &mut T,
         page_size: usize,
     ) -> Result<u64, MemoryError> {
-        // Copy a block at a time out of guest memory, then write it from the
-        // copy, so each byte is read from the guest once. Only zero runs of
-        // at least `MINIMUM_HOLE_PAGES`, or ones at a block's edge, are left
-        // as holes: each write into a btrfs file costs far more than its
-        // bytes, and writing around every zero page ran at a fifteenth of
-        // the speed of whole blocks.
-        const BLOCK_PAGES: usize = 512;
-        const MINIMUM_HOLE_PAGES: usize = 64;
-        let mut block = vec![0u8; BLOCK_PAGES * page_size];
+        // Copy a block at a time out of guest memory, then write its data
+        // runs from the copy, so each byte is read from the guest once.
+        let mut block = vec![0u8; SPARSE_BLOCK_PAGES * page_size];
         let mut skip: usize = 0;
         let mut written: u64 = 0;
         let mut offset = 0;
@@ -474,42 +470,8 @@ impl<'a> GuestMemorySlot<'a> {
             let length = (self.slice.len() - offset).min(block.len());
             let copy = &mut block[..length];
             self.slice.subslice(offset, length)?.copy_to(&mut *copy);
-            // `cursor` is the first byte of this block not yet written or
-            // skipped; `zeros` the start of the zero run being scanned.
-            let mut cursor = 0;
-            let mut zeros = None;
-            let mut page = 0;
-            while page < length {
-                let end = (page + page_size).min(length);
-                if is_zero(&copy[page..end]) {
-                    zeros.get_or_insert(page);
-                    page = end;
-                    continue;
-                }
-                if let Some(start) = zeros.take() {
-                    // A leading run, or a long one, becomes a hole.
-                    if start == cursor || page - start >= MINIMUM_HOLE_PAGES * page_size {
-                        if start > cursor {
-                            seek_forward(writer, &mut skip)?;
-                            writer.write_all_volatile(&VolatileSlice::from(
-                                &mut copy[cursor..start],
-                            ))?;
-                            written += (start - cursor) as u64;
-                        }
-                        skip += page - start;
-                        cursor = page;
-                    }
-                }
-                page = end;
-            }
-            // A trailing zero run becomes a hole.
-            let data_end = zeros.unwrap_or(length);
-            if data_end > cursor {
-                seek_forward(writer, &mut skip)?;
-                writer.write_all_volatile(&VolatileSlice::from(&mut copy[cursor..data_end]))?;
-                written += (data_end - cursor) as u64;
-            }
-            skip += length - data_end.max(cursor);
+            let runs = block_runs(copy, page_size);
+            written += write_block_runs(writer, copy, &runs, &mut skip)?;
             offset += length;
         }
         // Advance over trailing zero pages so the next slot starts at the
@@ -1095,6 +1057,232 @@ fn is_zero(bytes: &[u8]) -> bool {
         .all(|chunk| chunk.iter().fold(0u8, |acc, byte| acc | byte) == 0)
 }
 
+/// Pages a sparse dump copies and scans at a time.
+const SPARSE_BLOCK_PAGES: usize = 512;
+/// The shortest interior run of zero pages a sparse dump leaves as a hole.
+/// Each write into a btrfs or XFS file costs far more than its bytes, and
+/// writing around every zero page ran at a fifteenth of the speed of whole
+/// blocks.
+const MINIMUM_HOLE_PAGES: usize = 64;
+
+/// The data runs of one block of a sparse dump, as byte ranges. Everything
+/// else stays a hole: the zero run leading the block, the one trailing it,
+/// and interior ones of at least [`MINIMUM_HOLE_PAGES`] pages.
+fn block_runs(block: &[u8], page_size: usize) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    // `cursor` is where the data run being scanned starts; `zeros` where
+    // the zero run being scanned does.
+    let mut cursor = 0;
+    let mut zeros = None;
+    let mut page = 0;
+    while page < block.len() {
+        let end = (page + page_size).min(block.len());
+        if is_zero(&block[page..end]) {
+            zeros.get_or_insert(page);
+            page = end;
+            continue;
+        }
+        if let Some(start) = zeros.take()
+            && (start == cursor || page - start >= MINIMUM_HOLE_PAGES * page_size)
+        {
+            if start > cursor {
+                runs.push((cursor, start));
+            }
+            cursor = page;
+        }
+        page = end;
+    }
+    let data_end = zeros.unwrap_or(block.len());
+    if data_end > cursor {
+        runs.push((cursor, data_end));
+    }
+    runs
+}
+
+/// Writes a block's data runs, seeking over its holes; `skip` carries the
+/// holes not yet sought over, so the writer only ever moves forward.
+fn write_block_runs<T: WriteVolatile + std::io::Seek>(
+    writer: &mut T,
+    block: &mut [u8],
+    runs: &[(usize, usize)],
+    skip: &mut usize,
+) -> Result<u64, MemoryError> {
+    let mut cursor = 0;
+    let mut written = 0;
+    for &(start, end) in runs {
+        *skip += start - cursor;
+        seek_forward(writer, skip)?;
+        writer.write_all_volatile(&VolatileSlice::from(&mut block[start..end]))?;
+        written += (end - start) as u64;
+        cursor = end;
+    }
+    *skip += block.len() - cursor;
+    Ok(written)
+}
+
+/// Hermes: one block of a sparse dump for a [`DumpHelpers`] thread.
+struct DumpJob {
+    memory: GuestMemoryMmap,
+    address: GuestAddress,
+    length: usize,
+    page_size: usize,
+    buffer: Vec<u8>,
+    done: std::sync::mpsc::SyncSender<DumpedBlock>,
+}
+
+/// A block a helper copied out of guest memory, and its data runs.
+struct DumpedBlock {
+    buffer: Vec<u8>,
+    runs: Result<Vec<(usize, usize)>, MemoryError>,
+}
+
+/// Hermes: threads that copy guest memory out block by block and find each
+/// block's holes during a sparse dump, while the VMM thread writes the
+/// blocks strictly in file order, which keeps the file and its holes as a
+/// serial dump makes them and lets a host follow the writer's position.
+/// They start while the VM is built, before the VMM thread's seccomp filter
+/// forbids new threads, and install that filter themselves.
+struct DumpHelpers {
+    jobs: std::sync::mpsc::Sender<DumpJob>,
+}
+
+static DUMP_HELPERS: std::sync::OnceLock<DumpHelpers> = std::sync::OnceLock::new();
+/// Blocks a parallel dump keeps in flight.
+const DUMP_WINDOW: usize = 16;
+
+/// Starts `count` sparse-dump helpers under the VMM thread's seccomp filter.
+pub fn start_dump_helpers(
+    filter: Arc<crate::seccomp::BpfProgram>,
+    count: usize,
+) -> std::io::Result<()> {
+    if DUMP_HELPERS.get().is_some() || count == 0 {
+        return Ok(());
+    }
+    let (jobs, inbox) = std::sync::mpsc::channel::<DumpJob>();
+    let inbox = Arc::new(Mutex::new(inbox));
+    for index in 0..count {
+        let inbox = Arc::clone(&inbox);
+        let filter = Arc::clone(&filter);
+        std::thread::Builder::new()
+            .name(format!("fc_dump_{index}"))
+            .spawn(move || {
+                if let Err(err) = crate::seccomp::apply_filter(&filter) {
+                    error!("Dump helper could not install its seccomp filter: {err}");
+                    return;
+                }
+                loop {
+                    let job = match inbox.lock() {
+                        Ok(inbox) => inbox.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(mut job) = job else { return };
+                    let runs = job
+                        .memory
+                        .get_slice(job.address, job.length)
+                        .map_err(MemoryError::WriteMemory)
+                        .map(|slice| {
+                            slice.copy_to(&mut job.buffer[..job.length]);
+                            block_runs(&job.buffer[..job.length], job.page_size)
+                        });
+                    let _ = job.done.send(DumpedBlock {
+                        buffer: job.buffer,
+                        runs,
+                    });
+                }
+            })?;
+    }
+    let _ = DUMP_HELPERS.set(DumpHelpers { jobs });
+    Ok(())
+}
+
+/// One stretch of a dump in file order.
+enum DumpSegment {
+    /// Plugged memory, at most one block.
+    Block {
+        address: GuestAddress,
+        length: usize,
+    },
+    /// An unplugged slot, left as a hole.
+    Hole(usize),
+}
+
+/// A sparse dump whose blocks the [`DumpHelpers`] copy and scan while this
+/// thread writes them in order; the result is byte for byte the serial
+/// dump's, holes included.
+fn dump_sparse_parallel<T: WriteVolatile + std::io::Seek>(
+    memory: &GuestMemoryMmap,
+    writer: &mut T,
+    helpers: &DumpHelpers,
+    page_size: usize,
+) -> Result<u64, MemoryError> {
+    let block_bytes = SPARSE_BLOCK_PAGES * page_size;
+    let mut segments = Vec::new();
+    for region in memory.iter() {
+        for (slot, plugged) in region.slots() {
+            let length = slot.slice.len();
+            if !plugged {
+                segments.push(DumpSegment::Hole(length));
+                continue;
+            }
+            let mut offset = 0;
+            while offset < length {
+                let block = (length - offset).min(block_bytes);
+                segments.push(DumpSegment::Block {
+                    address: slot.guest_addr.unchecked_add(offset as u64),
+                    length: block,
+                });
+                offset += block;
+            }
+        }
+    }
+    let mut buffers: Vec<Vec<u8>> = Vec::new();
+    let mut pending = std::collections::VecDeque::new();
+    let mut in_flight = 0;
+    let mut segments = segments.into_iter();
+    let mut skip = 0;
+    let mut written = 0;
+    loop {
+        while in_flight < DUMP_WINDOW {
+            match segments.next() {
+                Some(DumpSegment::Block { address, length }) => {
+                    let (done, result) = std::sync::mpsc::sync_channel(1);
+                    let buffer = buffers.pop().unwrap_or_else(|| vec![0u8; block_bytes]);
+                    helpers
+                        .jobs
+                        .send(DumpJob {
+                            memory: memory.clone(),
+                            address,
+                            length,
+                            page_size,
+                            buffer,
+                            done,
+                        })
+                        .map_err(|_| MemoryError::DumpHelperStopped)?;
+                    pending.push_back((length, Some(result)));
+                    in_flight += 1;
+                }
+                Some(DumpSegment::Hole(length)) => pending.push_back((length, None)),
+                None => break,
+            }
+        }
+        let Some((length, result)) = pending.pop_front() else {
+            break;
+        };
+        let Some(result) = result else {
+            skip += length;
+            continue;
+        };
+        // A helper that dies drops its job's sender, failing the dump.
+        let mut block = result.recv().map_err(|_| MemoryError::DumpHelperStopped)?;
+        in_flight -= 1;
+        let runs = block.runs?;
+        written += write_block_runs(writer, &mut block.buffer[..length], &runs, &mut skip)?;
+        buffers.push(block.buffer);
+    }
+    seek_forward(writer, &mut skip)?;
+    Ok(written)
+}
+
 /// Seeks the writer forward by `skip` bytes, if any, and resets it.
 fn seek_forward<T: std::io::Seek>(writer: &mut T, skip: &mut usize) -> Result<(), MemoryError> {
     if *skip > 0 {
@@ -1236,6 +1424,9 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         writer: &mut T,
     ) -> Result<u64, MemoryError> {
         let page_size = host_page_size();
+        if let Some(helpers) = DUMP_HELPERS.get() {
+            return dump_sparse_parallel(self, writer, helpers, page_size);
+        }
         self.iter()
             .flat_map(|region| region.slots())
             .try_fold(0, |written, (mem_slot, plugged)| {
@@ -1832,6 +2023,81 @@ mod tests {
             .read(restored.as_mut_slice(), GuestAddress(0))
             .unwrap();
         assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn test_parallel_sparse_dump_matches_the_serial_one() {
+        let page_size = host_page_size();
+        // Two regions with data, short and long zero runs, and a block
+        // boundary crossed by data.
+        let region_size = page_size * (SPARSE_BLOCK_PAGES * 3 + 7);
+        let mem_regions = [
+            (GuestAddress(0), region_size),
+            (GuestAddress((region_size + page_size) as u64), region_size),
+        ];
+        let guest_memory = into_region_ext(
+            anonymous(mem_regions.into_iter(), true, HugePageConfig::None).unwrap(),
+        );
+        for (page, value) in [
+            (0usize, 1u8),
+            (3, 2),
+            (SPARSE_BLOCK_PAGES - 1, 3),
+            (SPARSE_BLOCK_PAGES, 4),
+            (SPARSE_BLOCK_PAGES + 200, 5),
+            (SPARSE_BLOCK_PAGES * 3 + 2, 6),
+        ] {
+            for region in [0u64, (region_size + page_size) as u64] {
+                guest_memory
+                    .write(
+                        &vec![value; page_size],
+                        GuestAddress(region + (page * page_size) as u64),
+                    )
+                    .unwrap();
+            }
+        }
+        let dump = |parallel: bool| {
+            let mut file = TempFile::new().unwrap().into_file();
+            file.set_len((region_size * 2) as u64).unwrap();
+            let written = if parallel {
+                let helpers = DUMP_HELPERS.get_or_init(|| {
+                    let (jobs, inbox) = std::sync::mpsc::channel::<DumpJob>();
+                    std::thread::spawn(move || {
+                        for mut job in inbox {
+                            let runs = job
+                                .memory
+                                .get_slice(job.address, job.length)
+                                .map_err(MemoryError::WriteMemory)
+                                .map(|slice| {
+                                    slice.copy_to(&mut job.buffer[..job.length]);
+                                    block_runs(&job.buffer[..job.length], job.page_size)
+                                });
+                            let _ = job.done.send(DumpedBlock {
+                                buffer: job.buffer,
+                                runs,
+                            });
+                        }
+                    });
+                    DumpHelpers { jobs }
+                });
+                dump_sparse_parallel(&guest_memory, &mut file, helpers, page_size).unwrap()
+            } else {
+                guest_memory
+                    .iter()
+                    .flat_map(|region| region.slots())
+                    .map(|(slot, _)| slot.dump_sparse(&mut file, page_size).unwrap())
+                    .sum()
+            };
+            let mut contents = Vec::new();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            std::io::Read::read_to_end(&mut file, &mut contents).unwrap();
+            let allocated = file.metadata().unwrap().blocks();
+            (written, contents, allocated)
+        };
+        let serial = dump(false);
+        let parallel = dump(true);
+        assert_eq!(serial.0, parallel.0);
+        assert!(serial.1 == parallel.1);
+        assert_eq!(serial.2, parallel.2);
     }
 
     #[test]
